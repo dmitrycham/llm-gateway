@@ -4,12 +4,15 @@ version = "0.1.0"
 description = "RAG service and worker for llm-gateway"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "pydantic>=2.14",
+]
 
 [dependency-groups]
 dev = [
     "mypy>=1.18",
     "pytest>=8.4",
+    "pytest-asyncio>=1.4",
     "ruff>=0.17",
 ]
 
@@ -44,7 +47,14 @@ select = [
 strict = true
 files = ["src", "tests"]
 mypy_path = "src"
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers"]
+asyncio_mode = "auto"
