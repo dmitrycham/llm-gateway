@@ -1,0 +1,7 @@
+# Redocly CLI config for `make lint-api`.
+# recommended-strict turns every recommended warning into an error, so the lint has one outcome.
+telemetry: off
+extends:
+  - recommended-strict
+# Health probes have no client errors (200 or 503 only), so .redocly.lint-ignore.yaml skips
+# operation-4xx-response for them; every other operation still needs a 4xx response.
