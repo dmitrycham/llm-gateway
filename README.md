@@ -21,10 +21,11 @@ and an LLM evaluation suite. The RAG widget is the gateway's first client.
 
 ## Development
 
-Requirements: Go, golangci-lint v2, Python 3.13+, uv.
+Requirements: Go, golangci-lint v2, Python 3.13+, uv, Node.js with npm (for `npx`).
 
 ```sh
-make lint     # golangci-lint + ruff + mypy
+make lint     # golangci-lint + ruff + mypy + Redocly (OpenAPI)
+make lint-api # Redocly lint of api/openapi contracts
 make fmt      # format Go and Python code
 make test-go
 make test-py

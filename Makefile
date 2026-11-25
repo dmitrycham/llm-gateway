@@ -4,13 +4,19 @@ GOLANGCI   := golangci-lint
 UV         := uv
 # Absolute path, because golangci-lint runs inside each module directory.
 GOLANGCI_CONFIG := $(CURDIR)/.golangci.yml
+# Pinned so local runs and CI lint the contracts with the same rules.
+REDOCLY    := npx --yes @redocly/cli@2.83.0
+OPENAPI    := api/openapi/internal-ai.yaml
 
-.PHONY: help lint lint-go lint-py fmt fmt-go fmt-py test test-go test-py py-sync
+.PHONY: help lint lint-go lint-py lint-api fmt fmt-go fmt-py test test-go test-py py-sync
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-10s %s\n", $$1, $$2}'
 
-lint: lint-go lint-py ## Run all linters
+lint: lint-go lint-py lint-api ## Run all linters
+
+lint-api: ## Lint OpenAPI contracts
+	$(REDOCLY) lint --config redocly.yaml $(OPENAPI)
 
 # golangci-lint does not lint a go.work multi-module tree with ./..., so run it per module.
 lint-go:

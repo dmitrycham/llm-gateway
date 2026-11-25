@@ -1,0 +1,856 @@
+openapi: 3.1.0
+info:
+  title: AI Service internal API
+  version: 0.1.0
+  summary: Go API → Python RAG service contract.
+  description: |
+    Internal API of the Python AI Service, called only by the Go API (ADR-001).
+    This file is the source of truth (ADR-005): Go generates its client from it, and CI
+    compares the FastAPI schema export with it.
+
+    The API is reachable only inside the private network and must never be called from a
+    browser. Go fills `workspace_id`, `site_id` and `session_id` from the verified session;
+    a client cannot set them.
+
+    **Headers on every `/internal/v1/*` call**
+
+    - `X-Request-ID`: created at the Go entry point, passed through every hop and log line,
+      returned in every response body.
+    - `X-Request-Deadline-Ms`: remaining time budget at the moment of sending, already minus
+      the Go safety margin (spec 4.3). Python turns it into a local monotonic deadline,
+      wraps the whole handler in `asyncio.timeout(...)` and forwards the remaining time to
+      the gateway.
+    - `traceparent`: W3C trace context when tracing is on.
+    - `Authorization: Bearer <service token>`.
+
+    **Retries.** Go does not retry `POST /internal/v1/chat/generate`, except for a
+    connection error before the request body is sent. Python does not retry paid calls
+    either: retries, fallback and budgets belong to the Go Gateway (ADR-003).
+
+    **Request errors.** A missing or invalid required header, or a body that is not valid
+    JSON, is `400 invalid_request`. A well-formed JSON body that breaks a field rule is
+    `422 validation_failed`, with one exception: a `message` longer than the limit is
+    `413 message_too_long` (spec 7.4). Limits that are deployment settings (history length,
+    maximum deadline) are not fixed in this schema; Python enforces the configured values at
+    runtime and answers `422 validation_failed` when a request exceeds them.
+
+    **Tracing.** `traceparent` is optional and never causes a `400`. Tracing middleware
+    parses it; an invalid value is ignored and a new trace is started (W3C Trace Context).
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://ai-service:8000
+    description: Docker Compose private network
+
+security:
+  - serviceToken: []
+
+tags:
+  - name: health
+    description: Liveness and readiness probes. No authentication.
+  - name: chat
+    description: RAG answer generation for the widget.
+
+paths:
+  /internal/health/live:
+    get:
+      tags: [health]
+      operationId: getLiveness
+      summary: Liveness probe
+      description: Returns 200 while the process can serve HTTP. Checks no dependencies.
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivenessStatus'
+              example:
+                status: ok
+
+  /internal/health/ready:
+    get:
+      tags: [health]
+      operationId: getReadiness
+      summary: Readiness probe
+      description: |
+        Returns 200 when the service can answer `generate`: PostgreSQL and the Go Gateway are
+        reachable. Returns 503 with the failed checks otherwise.
+
+        Redis is optional (spec 9.3): when it is down the service stays ready, reports
+        `degraded: true` and runs without the query embedding cache.
+      security: []
+      responses:
+        '200':
+          description: Ready to serve traffic, possibly degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessReady'
+              examples:
+                healthy:
+                  summary: All dependencies up
+                  value:
+                    status: ready
+                    degraded: false
+                    checks:
+                      postgres: ok
+                      gateway: ok
+                      redis: ok
+                redisDown:
+                  summary: Redis unavailable, still ready
+                  value:
+                    status: ready
+                    degraded: true
+                    checks:
+                      postgres: ok
+                      gateway: ok
+                      redis: fail
+        '503':
+          description: Not ready. At least one required check failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessNotReady'
+              example:
+                status: not_ready
+                degraded: false
+                checks:
+                  postgres: ok
+                  gateway: fail
+                  redis: ok
+
+  /internal/v1/chat/generate:
+    post:
+      tags: [chat]
+      operationId: generateChatAnswer
+      summary: Condense, retrieve and generate a cited answer
+      description: |
+        Python performs hybrid retrieval and citation checks. It calls the gateway for
+        condensation, query embeddings, and answer generation (ADR-003, spec 4.4, FR-04).
+
+        **Idempotency (ADR-009).** The Go API computes
+        `X-Idempotency-Key-Hash = sha256(session_id || Idempotency-Key)` and
+        `X-Idempotency-Request-Hash` from the client request body. Python does not store
+        results: it forwards both headers to the gateway, which owns the stored result and
+        its lease.
+
+        1. Before any paid step, Python calls the gateway lookup
+           (`GET /internal/v1/generations/lookup`, `gateway.yaml`):
+           - completed → the stored answer is returned with `replayed: true`; no paid calls,
+             no budget or quota checks;
+           - final failure → the stored error is returned with its original status;
+           - still running → `409 request_in_progress` + `Retry-After`;
+           - same key, different request hash → `422 idempotency_key_reuse`;
+           - not found → the full pipeline runs.
+        2. The gateway repeats the same check inside its `generate` call, so a result
+           committed between the lookup and `generate` is still returned, not paid again.
+           This request may already have paid for condensation and the query embedding.
+           `usage.request` counts tokens from model calls this request actually made; it is
+           zero when no model call ran, including on a late replay. `usage.answer` is the
+           stored answer.
+
+        | Same key and | Response |
+        | --- | --- |
+        | same request hash, result committed | `200`, same answer, `replayed: true` |
+        | same request hash, still running | `409 request_in_progress` + `Retry-After` |
+        | different request hash | `422 idempotency_key_reuse` |
+
+        Python passes `409` up unchanged; the Go API returns it to the client with
+        `Retry-After` and does not change its own key state.
+
+        **Deadline.** If the deadline expires, Python stops local work and returns
+        `504 timeout`. The provider may still finish and bill the call (spec 4.3).
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XRequestDeadlineMs'
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/XIdempotencyKeyHash'
+        - $ref: '#/components/parameters/XIdempotencyRequestHash'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateRequest'
+            example:
+              workspace_id: 0193a0aa-0000-7a10-8d44-0a1b2c3d4e5f
+              site_id: 0193a0aa-0001-7a10-8d44-0a1b2c3d4e5f
+              session_id: 0193a1f0-7c2e-7a10-9b55-3f6c2d9e8a01
+              message: How long does the return take?
+              history:
+                - role: user
+                  content: What are the product return conditions?
+                - role: assistant
+                  content: Returns are possible within 30 days if the store's conditions are met [S1].
+      responses:
+        '200':
+          description: |
+            Answer generated, or a committed answer replayed (`replayed: true`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateResponse'
+              examples:
+                generated:
+                  summary: New answer
+                  value:
+                    answer: Refunds are paid within 14 days after the store receives the item [S1].
+                    grounding: cited
+                    citations:
+                      - label: S1
+                        document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                        version_id: 0193a0aa-1112-7e55-8d44-0a1b2c3d4e5f
+                        chunk_id: 0193a0aa-2222-7f66-9e55-1b2c3d4e5f60
+                        title_at_generation: Return policy
+                        section: Return periods
+                    replayed: false
+                    provider: ollama
+                    model: configured-chat-model
+                    usage:
+                      answer:
+                        input_tokens: 2140
+                        output_tokens: 38
+                      request:
+                        input_tokens: 2318
+                        output_tokens: 52
+                    latency:
+                      total_ms: 3120
+                      condense_ms: 410
+                      retrieval_ms: 95
+                      llm_ms: 2580
+                    request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+                replayedAfterLookupMiss:
+                  summary: Lookup missed, another request committed before generate
+                  value:
+                    answer: Refunds are paid within 14 days after the store receives the item [S1].
+                    grounding: cited
+                    citations:
+                      - label: S1
+                        document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                        version_id: 0193a0aa-1112-7e55-8d44-0a1b2c3d4e5f
+                        chunk_id: 0193a0aa-2222-7f66-9e55-1b2c3d4e5f60
+                        title_at_generation: Return policy
+                        section: Return periods
+                    replayed: true
+                    provider: ollama
+                    model: configured-chat-model
+                    usage:
+                      answer:
+                        input_tokens: 2140
+                        output_tokens: 38
+                      request:
+                        input_tokens: 178
+                        output_tokens: 14
+                    latency:
+                      total_ms: 560
+                      condense_ms: 405
+                      retrieval_ms: 92
+                      llm_ms: 18
+                    request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2c
+                noAnswer:
+                  summary: No evidence in the knowledge base
+                  value:
+                    answer: I could not find this in the available documents.
+                    grounding: no_answer
+                    citations: []
+                    replayed: false
+                    provider: ollama
+                    model: configured-chat-model
+                    usage:
+                      answer:
+                        input_tokens: 1980
+                        output_tokens: 12
+                      request:
+                        input_tokens: 1988
+                        output_tokens: 12
+                    latency:
+                      total_ms: 2210
+                      condense_ms: 0
+                      retrieval_ms: 88
+                      llm_ms: 2090
+                    request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2b
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          $ref: '#/components/responses/RequestInProgress'
+        '413':
+          $ref: '#/components/responses/MessageTooLong'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '502':
+          $ref: '#/components/responses/ProviderError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+components:
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+      description: |
+        Static service token inside the Compose network (MVP), or a short-lived signed
+        service JWT outside Compose (spec 4.2).
+
+  parameters:
+    XRequestId:
+      name: X-Request-ID
+      in: header
+      required: true
+      description: Request ID (UUID or ULID) created at the Go entry point.
+      schema:
+        $ref: '#/components/schemas/RequestId'
+      example: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+    XRequestDeadlineMs:
+      name: X-Request-Deadline-Ms
+      in: header
+      required: true
+      description: |
+        Remaining time budget in milliseconds, already minus the caller's margin. No upper
+        bound in the schema: the handler deadline is a deployment setting (spec 4.3).
+      schema:
+        type: integer
+        minimum: 1
+      example: 58000
+    Traceparent:
+      name: traceparent
+      in: header
+      required: false
+      description: |
+        W3C trace context. `X-Request-ID` does not replace it. Not validated by the API:
+        tracing middleware parses it and starts a new trace when the value is invalid.
+      schema:
+        type: string
+      example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    XIdempotencyKeyHash:
+      name: X-Idempotency-Key-Hash
+      in: header
+      required: true
+      description: |
+        `sha256(session_id || Idempotency-Key)` as lowercase hex. Forwarded unchanged to the
+        gateway (ADR-009).
+      schema:
+        $ref: '#/components/schemas/Sha256Hex'
+      example: 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b
+    XIdempotencyRequestHash:
+      name: X-Idempotency-Request-Hash
+      in: header
+      required: true
+      description: |
+        `sha256` of the canonical JSON of the client request body, as lowercase hex.
+        Computed by the Go API from the client request, not from the gateway body, because
+        retrieval on a retry may build a different context (ADR-009).
+      schema:
+        $ref: '#/components/schemas/Sha256Hex'
+      example: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
+  headers:
+    RetryAfter:
+      description: Seconds to wait before retrying with the same idempotency key.
+      schema:
+        type: integer
+        minimum: 0
+      example: 5
+
+  schemas:
+    Sha256Hex:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+
+    RequestId:
+      type: string
+      description: UUID or ULID (spec 4.2).
+      anyOf:
+        - pattern: '^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$'
+        - pattern: '^[0-7][0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{25}$'
+
+    LivenessStatus:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+
+    ReadinessReady:
+      type: object
+      additionalProperties: false
+      required: [status, degraded, checks]
+      properties:
+        status:
+          type: string
+          const: ready
+        degraded:
+          type: boolean
+          description: '`true` when an optional dependency such as Redis is down (spec 9.3).'
+        checks:
+          $ref: '#/components/schemas/ReadyChecks'
+
+    ReadinessNotReady:
+      type: object
+      additionalProperties: false
+      required: [status, degraded, checks]
+      properties:
+        status:
+          type: string
+          const: not_ready
+        degraded:
+          type: boolean
+          description: '`true` when an optional dependency such as Redis is down (spec 9.3).'
+        checks:
+          $ref: '#/components/schemas/NotReadyChecks'
+
+    ReadinessChecks:
+      type: object
+      description: |
+        Result of each dependency check, keyed by dependency name. `postgres` and `gateway`
+        are required for readiness; others (such as `redis`) are optional.
+      required: [postgres, gateway]
+      properties:
+        postgres:
+          $ref: '#/components/schemas/CheckResult'
+        gateway:
+          $ref: '#/components/schemas/CheckResult'
+      additionalProperties:
+        $ref: '#/components/schemas/CheckResult'
+
+    ReadyChecks:
+      description: Both required checks pass. Optional checks may fail.
+      allOf:
+        - $ref: '#/components/schemas/ReadinessChecks'
+        - properties:
+            postgres:
+              const: ok
+            gateway:
+              const: ok
+
+    NotReadyChecks:
+      description: At least one required check fails.
+      allOf:
+        - $ref: '#/components/schemas/ReadinessChecks'
+        - anyOf:
+            - properties:
+                postgres:
+                  const: fail
+            - properties:
+                gateway:
+                  const: fail
+
+    CheckResult:
+      type: string
+      enum: [ok, fail]
+
+    GenerateRequest:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, site_id, session_id, message, history]
+      properties:
+        workspace_id:
+          type: string
+          format: uuid
+          description: From the verified session, never from the client.
+        site_id:
+          type: string
+          format: uuid
+          description: From the verified session, never from the client.
+        session_id:
+          type: string
+          format: uuid
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: |
+            The user's question (spec 9.2 message length limit). Longer text is
+            `413 message_too_long`, not `422`.
+        history:
+          type: array
+          description: |
+            Previous turns of the session, oldest first. The maximum is a deployment setting
+            (spec 10, default 6) enforced at runtime: more items → `422 validation_failed`.
+          items:
+            $ref: '#/components/schemas/HistoryMessage'
+
+    HistoryMessage:
+      type: object
+      additionalProperties: false
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          type: string
+          minLength: 1
+
+    GenerateResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - answer
+        - grounding
+        - citations
+        - replayed
+        - provider
+        - model
+        - usage
+        - latency
+        - request_id
+      properties:
+        answer:
+          type: string
+          description: Answer text with only valid `[Sn]` labels kept (FR-04).
+        grounding:
+          type: string
+          enum: [cited, uncited, no_answer]
+          description: |
+            `cited`: valid citations present. `uncited`: no valid citations, the UI marks the
+            answer as unsupported. `no_answer`: the model reported insufficient data.
+        citations:
+          type: array
+          description: Labels cited by the model ∩ labels passed in the context.
+          items:
+            $ref: '#/components/schemas/Citation'
+        replayed:
+          type: boolean
+          description: |
+            `true` when the gateway returned a committed result for this idempotency key.
+            Citations then come from the stored source map, not from a new retrieval.
+        provider:
+          type: string
+          description: Provider that produced the answer, as reported by the gateway.
+        model:
+          type: string
+          description: Model that produced the answer, as reported by the gateway.
+        usage:
+          $ref: '#/components/schemas/Usage'
+        latency:
+          $ref: '#/components/schemas/Latency'
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+
+    Citation:
+      type: object
+      additionalProperties: false
+      required: [label, document_id, version_id, chunk_id, title_at_generation]
+      description: |
+        One entry of the source map sent to the gateway as `client_metadata` (ADR-009). Go
+        builds the public `url` and checks that the source is still available.
+      properties:
+        label:
+          type: string
+          pattern: '^S[1-9][0-9]*$'
+        document_id:
+          type: string
+          format: uuid
+        version_id:
+          type: string
+          format: uuid
+        chunk_id:
+          type: string
+          format: uuid
+        title_at_generation:
+          type: string
+          description: Document title when the answer was generated (FR-04 source snapshot).
+        section:
+          type: [string, 'null']
+
+    Usage:
+      type: object
+      additionalProperties: false
+      required: [answer, request]
+      description: |
+        Informational token counts. Billing records are kept by the gateway for every paid
+        call (ADR-003), not derived from this object.
+      properties:
+        answer:
+          $ref: '#/components/schemas/TokenUsage'
+          description: |
+            Tokens of the generation that produced `answer`. On a replay these are the
+            stored values of the original generation.
+        request:
+          $ref: '#/components/schemas/TokenUsage'
+          description: |
+            Tokens from model calls this request actually made (condensation, query
+            embedding, generation). Zero when no model call ran, including on a late replay
+            (first turn without condensation, cached query embedding, result committed by
+            another request before `generate`).
+
+    TokenUsage:
+      type: object
+      additionalProperties: false
+      required: [input_tokens, output_tokens]
+      properties:
+        input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+
+    Latency:
+      type: object
+      additionalProperties: false
+      required: [total_ms, condense_ms, retrieval_ms, llm_ms]
+      description: |
+        Report elapsed time for each stage executed by this request. Skipped stages are zero
+        (spec 14.3).
+      properties:
+        total_ms:
+          type: integer
+          minimum: 0
+        condense_ms:
+          type: integer
+          minimum: 0
+        retrieval_ms:
+          type: integer
+          minimum: 0
+        llm_ms:
+          type: integer
+          minimum: 0
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error, request_id]
+      description: Unified error contract (spec 7.4).
+      properties:
+        error:
+          $ref: '#/components/schemas/Error'
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - unauthenticated
+            - request_in_progress
+            - message_too_long
+            - validation_failed
+            - idempotency_key_reuse
+            - rate_limited
+            - budget_exceeded
+            - provider_error
+            - provider_unavailable
+            - dependency_unavailable
+            - timeout
+        message:
+          type: string
+          description: Human-readable text. Never contains secrets or user message text.
+        retryable:
+          type: boolean
+          description: Whether a retry with the same idempotency key can succeed.
+        details:
+          type: object
+          description: Optional machine-readable context, for example invalid fields.
+          additionalProperties: true
+
+  responses:
+    BadRequest:
+      description: Missing or invalid header, or a body that is not valid JSON.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: invalid_request
+              message: Header X-Request-Deadline-Ms is required
+              retryable: false
+              details:
+                header: X-Request-Deadline-Ms
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    Unauthenticated:
+      description: Missing or invalid service token.
+      headers:
+        # RFC 9110 15.5.2: a 401 must carry a challenge for the expected scheme.
+        WWW-Authenticate:
+          required: true
+          description: Authentication challenge for the service token scheme.
+          schema:
+            type: string
+          example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: unauthenticated
+              message: Service token is missing or invalid
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    RequestInProgress:
+      description: |
+        Another handler holds a live lease for this idempotency key. Retry after
+        `Retry-After` seconds with the same key.
+      headers:
+        # Required here (optional elsewhere): Go must forward the interval to the widget.
+        Retry-After:
+          required: true
+          description: Seconds to wait before retrying with the same idempotency key.
+          schema:
+            type: integer
+            minimum: 0
+          example: 5
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: request_in_progress
+              message: A request with this idempotency key is still being processed
+              retryable: true
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    MessageTooLong:
+      description: '`message` is longer than the limit (spec 7.4, 9.2).'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: message_too_long
+              message: The message exceeds the maximum length
+              retryable: false
+              details:
+                max_length: 2000
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    UnprocessableEntity:
+      description: Body breaks a field rule, or the idempotency key was reused with another body.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            validationFailed:
+              summary: Field rule broken
+              value:
+                error:
+                  code: validation_failed
+                  message: Request body failed validation
+                  retryable: false
+                  details:
+                    fields:
+                      - path: session_id
+                        reason: must be a UUID
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            idempotencyKeyReuse:
+              summary: Same key, different request hash
+              value:
+                error:
+                  code: idempotency_key_reuse
+                  message: This idempotency key was already used with a different request
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    TooManyRequests:
+      description: |
+        Rate limit hit (`rate_limited`, with `Retry-After`) or budget exhausted
+        (`budget_exceeded`). Never returned for a replay of a committed result.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            rateLimited:
+              summary: Provider or workspace rate limit
+              value:
+                error:
+                  code: rate_limited
+                  message: Too many requests, retry later
+                  retryable: true
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            budgetExceeded:
+              summary: Workspace or site budget exhausted
+              value:
+                error:
+                  code: budget_exceeded
+                  message: The budget for this workspace is exhausted
+                  retryable: false
+                  details:
+                    scope: workspace
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    ProviderError:
+      description: The provider returned an error the gateway could not recover from.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: provider_error
+              message: The model provider returned an error
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    ServiceUnavailable:
+      description: |
+        No provider is available (`provider_unavailable`) or a dependency such as
+        PostgreSQL or the gateway is down (`dependency_unavailable`).
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            providerUnavailable:
+              summary: All allowed providers are unavailable
+              value:
+                error:
+                  code: provider_unavailable
+                  message: The answer service is temporarily unavailable
+                  retryable: true
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            dependencyUnavailable:
+              summary: PostgreSQL or the gateway is unreachable
+              value:
+                error:
+                  code: dependency_unavailable
+                  message: A required dependency is unavailable
+                  retryable: true
+                  details:
+                    dependency: gateway
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    Timeout:
+      description: |
+        The deadline from `X-Request-Deadline-Ms` expired. Local work stopped; the provider
+        may still have billed the call. Retry with the same idempotency key to get the
+        result if it was committed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: timeout
+              message: The request deadline expired
+              retryable: true
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
