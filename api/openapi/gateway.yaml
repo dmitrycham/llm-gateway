@@ -1,0 +1,1866 @@
+openapi: 3.1.0
+info:
+  title: LLM Gateway API
+  version: 0.1.0
+  summary: OpenAI-compatible public API and internal model operations of the Go Gateway.
+  description: |
+    The Go Gateway is the only component that calls model providers (ADR-003). It owns
+    provider routing, retries, fallback, budgets, quotas and usage records.
+
+    This file is the source of truth (ADR-005). It has two groups of operations:
+
+    - **`public`**: an OpenAI-compatible subset of `POST /v1/chat/completions` (ADR-013) for
+      external applications. The official OpenAI SDKs work after changing only the base URL
+      (`<server>/v1`) and the API key.
+    - **`internal`**: generation, embeddings and the idempotency lookup for the Python RAG
+      service and the indexing worker. Reachable only inside the private network.
+
+    **Two listeners.** `/v1/*` is served on the public listener (`:8080`, published).
+    `/internal/*`, including the unauthenticated health probes, is served only on the
+    internal listener (`:8081`), which is never published. The public listener answers
+    `404` for `/internal/*`, so a leaked service token cannot be used from outside.
+
+    **Error contract.** Every error has the same body (spec 7.4, extended for OpenAI clients):
+    `{error: {message, type, code, param, retryable, details?}, request_id}`. OpenAI clients
+    read `message`, `type`, `code` and `param`; our clients use `code` and `retryable`.
+
+    **Forwarding errors.** Each hop has its own error contract, so Python never forwards a
+    gateway error body unchanged. It keeps `code`, `message`, `retryable`, `details` and
+    `Retry-After`, drops `type` and `param`, and answers with the status that
+    `internal-ai.yaml` declares for that code (for example, `402 budget_exceeded` becomes
+    `429 budget_exceeded`). `unsupported_parameter` and `model_not_found` can only come from
+    a Python bug: Python logs them and returns its own error. `not_found` from the lookup
+    means "run the full pipeline" and is never forwarded.
+
+    **Retries by clients.** The OpenAI SDKs retry `408`, `409`, `429` and every `5xx` by
+    default and obey the non-standard `x-should-retry` header. Every error response carries
+    `x-should-retry` equal to `error.retryable`, so an SDK never repeats a request that
+    cannot succeed or that could start a second paid call. Python does not retry at all
+    (ADR-003).
+
+    **Request ID.** Every response of `/v1/*` and `/internal/v1/*` carries `X-Request-ID`
+    (the health probes do not). The OpenAI SDKs read the request ID from this header, not
+    from the body.
+
+    **Tracing.** `traceparent` is optional and never causes a `400`. An invalid value is
+    ignored and a new trace is started (W3C Trace Context).
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://gateway:8080
+    description: Public listener (`/v1/*` only). OpenAI clients use base URL `<server>/v1`.
+  - url: http://gateway:8081
+    description: Internal listener (`/internal/*` only). Private network, never published.
+
+tags:
+  - name: public
+    description: OpenAI-compatible API for external applications. Application API key.
+  - name: internal
+    description: Model operations for the Python RAG service and worker. Service token.
+  - name: health
+    description: Liveness and readiness probes. No authentication.
+
+paths:
+  /v1/chat/completions:
+    servers:
+      - url: http://gateway:8080
+        description: Public listener
+    post:
+      tags: [public]
+      operationId: createChatCompletion
+      summary: Create a chat completion (OpenAI-compatible subset)
+      description: |
+        Supported subset of the OpenAI Chat Completions API (ADR-013). `model` is a model
+        alias configured for the application; the gateway picks the provider and may fall
+        back to another allowed model before the first byte of the answer (ADR-003).
+
+        **Not supported.** Tool calling, structured output, log probabilities and `n > 1`
+        are not supported. `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`,
+        `logprobs` and `store` are accepted only with the no-op values that many clients send
+        by default (for example `tools: []`, `logprobs: false`); any other value, and every
+        field not listed in the schema (such as `functions`), is `400 unsupported_parameter`
+        with `param` set to the field name.
+
+        **Sampling parameters and providers.** Providers support different parameter sets
+        and ranges (for example, Anthropic accepts `temperature` only from 0 to 1 and has no
+        `seed` or penalties). Before routing, the gateway drops every candidate provider,
+        including fallbacks, that cannot honour the request's parameters as sent; it never
+        changes a value silently. If no allowed provider can honour them, the request is
+        `400 unsupported_parameter` before any provider call, and it is never stored as a
+        result. The per-provider mapping is in ADR-013.
+
+        **Validation errors are `400`** (OpenAI behaviour), with `param` naming the field.
+        The only `422` is `idempotency_key_reuse`. Limits that are deployment settings
+        (maximum output tokens, total prompt size) are not fixed in this schema; the gateway
+        enforces the configured values at runtime with `400`. A deadline above the configured
+        maximum is clamped to it, never rejected. `stream_options` without `stream: true` is
+        `400 invalid_request`.
+
+        **Streaming (ADR-004).** With `stream: true` the response is Server-Sent Events.
+        All checks (validation, API key, quotas, data policy, budget reservation) run before
+        the first byte, and their failures are normal JSON errors. After the headers are
+        sent, the HTTP status cannot change:
+
+        - each event is `data: <ChatCompletionChunk JSON>`; the last event is `data: [DONE]`;
+        - the chunk with `finish_reason` is followed, with `include_usage`, by one extra chunk
+          with empty `choices` and the `usage` of the whole request; every other chunk then
+          has `usage: null`;
+        - a failure after the first chunk just closes the stream, with no error event;
+        - a stream is complete only if the client saw both a `finish_reason` and
+          `data: [DONE]`. Any other end is a partial answer, and the gateway records it the
+          same way.
+
+        The stream sets `Cache-Control: no-cache` and `X-Accel-Buffering: no`.
+
+        **Idempotency (ADR-009).** `Idempotency-Key` is optional. It is scoped by the
+        application of the API key: the record is found by `(workspace_id, idem_hash)` with
+        `idem_hash = sha256("api:" || application_id || ":" || Idempotency-Key)`. The `api:`
+        prefix keeps public keys apart from widget keys (`sha256(session_id || key)`), and
+        two applications of one workspace never share a key. The request hash is the
+        `sha256` of the canonical JSON body.
+
+        | Same key and | Response |
+        | --- | --- |
+        | same body, result committed | `200`, the stored completion, no provider call |
+        | same body, still running | `409 request_in_progress` + `Retry-After` |
+        | same body, final provider failure | the stored `502 provider_error`, no provider call |
+        | same body, expired lease or retryable failure | taken over, the provider is called again |
+        | different body | `422 idempotency_key_reuse` |
+
+        Only a final provider failure is stored as final. Budget, quota and rate-limit
+        rejections, `503` and `504` leave the record as a retryable failure: a retry with the
+        same key runs again and is never answered with the old error.
+
+        The idempotency check runs before quota and budget checks, so `budget_exceeded`
+        never hides a committed result. Keys expire after 24 hours. `stream: true` with a key
+        is `400 invalid_request` in Phase 1: stored streams are not replayed.
+
+        **Deadline.** `X-Request-Deadline-Ms` is optional for external clients; without it,
+        or above the configured maximum, the gateway uses the configured maximum. On expiry
+        the gateway returns `504 timeout`; the provider may still bill the call.
+      security:
+        - apiKey: []
+      parameters:
+        - $ref: '#/components/parameters/XRequestIdOptional'
+        - $ref: '#/components/parameters/XRequestDeadlineMsOptional'
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+            examples:
+              basic:
+                summary: Non-streaming request
+                value:
+                  model: default-chat
+                  messages:
+                    - role: system
+                      content: You are a concise assistant.
+                    - role: user
+                      content: Name three prime numbers.
+                  max_completion_tokens: 64
+                  temperature: 0.2
+              noOpDefaults:
+                summary: Client that sends default values of unsupported features
+                value:
+                  model: default-chat
+                  messages:
+                    - role: user
+                      content: Name three prime numbers.
+                  tools: []
+                  tool_choice: none
+                  parallel_tool_calls: true
+                  response_format:
+                    type: text
+                  logprobs: false
+                  store: false
+              streaming:
+                summary: Streaming request with usage
+                value:
+                  model: default-chat
+                  messages:
+                    - role: user
+                      content:
+                        - type: text
+                          text: Name three prime numbers.
+                  stream: true
+                  stream_options:
+                    include_usage: true
+      responses:
+        '200':
+          description: |
+            A completion. `application/json` for `stream: false`, Server-Sent Events for
+            `stream: true`.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletion'
+              example:
+                id: chatcmpl-01JDX8Q4M7ZK3V9T2B6N5R8W1C
+                object: chat.completion
+                created: 1764079200
+                model: default-chat
+                choices:
+                  - index: 0
+                    message:
+                      role: assistant
+                      content: 2, 3 and 5.
+                    finish_reason: stop
+                    logprobs: null
+                usage:
+                  prompt_tokens: 24
+                  completion_tokens: 6
+                  total_tokens: 30
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  A sequence of SSE events. Each `data:` payload is a `ChatCompletionChunk`
+                  as JSON, except the final `[DONE]`. OpenAPI 3.1 cannot describe an event
+                  stream, so `contentSchema` names the per-event schema for readers and codegen.
+                contentSchema:
+                  $ref: '#/components/schemas/ChatCompletionChunk'
+              example: |
+                data: {"id":"chatcmpl-01JDX8Q4M7ZK3V9T2B6N5R8W1C","object":"chat.completion.chunk","created":1764079200,"model":"default-chat","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}
+
+                data: {"id":"chatcmpl-01JDX8Q4M7ZK3V9T2B6N5R8W1C","object":"chat.completion.chunk","created":1764079200,"model":"default-chat","choices":[{"index":0,"delta":{"content":"2, 3 and 5."},"finish_reason":null}],"usage":null}
+
+                data: {"id":"chatcmpl-01JDX8Q4M7ZK3V9T2B6N5R8W1C","object":"chat.completion.chunk","created":1764079200,"model":"default-chat","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}
+
+                data: {"id":"chatcmpl-01JDX8Q4M7ZK3V9T2B6N5R8W1C","object":"chat.completion.chunk","created":1764079200,"model":"default-chat","choices":[],"usage":{"prompt_tokens":14,"completion_tokens":6,"total_tokens":20}}
+
+                data: [DONE]
+
+        '400':
+          $ref: '#/components/responses/PublicBadRequest'
+        '401':
+          $ref: '#/components/responses/PublicUnauthenticated'
+        '402':
+          $ref: '#/components/responses/BudgetExceeded'
+        '404':
+          $ref: '#/components/responses/ModelNotFound'
+        '409':
+          $ref: '#/components/responses/RequestInProgress'
+        '422':
+          $ref: '#/components/responses/IdempotencyKeyReuse'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/ProviderError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /internal/v1/chat/completions:
+    servers: &internalServers
+      - url: http://gateway:8081
+        description: Internal listener
+    post:
+      tags: [internal]
+      operationId: createInternalChatCompletion
+      summary: Run a chat model call for the RAG service (condense or generate)
+      description: |
+        Non-streaming model call for the Python RAG service (ADR-003, ADR-004). The gateway
+        picks the model for the operation from the workspace configuration; the caller does
+        not choose it. Retries, fallback, budgets and usage records belong to the gateway.
+
+        **Idempotency (ADR-009).** Only `generate` accepts `X-Idempotency-Key-Hash` and
+        `X-Idempotency-Request-Hash`, and always both together. A single hash header, or
+        hash headers on `condense`, is `400 invalid_request`. With the headers, the gateway
+        stores the result in `gateway.generation_requests` under
+        `(workspace_id, idem_hash)` and repeats the lookup rules:
+
+        | Same key and | Response |
+        | --- | --- |
+        | same request hash, result committed | `200`, stored result, `replayed: true` |
+        | same request hash, still running | `409 request_in_progress` + `Retry-After` |
+        | same request hash, final provider failure | the stored `502 provider_error` |
+        | same request hash, expired lease or retryable failure | taken over, model called again |
+        | different request hash | `422 idempotency_key_reuse` |
+
+        Only a final provider failure is stored as final. Budget, quota and rate-limit
+        rejections, `503` and `504` leave the record as a retryable failure, so they are
+        never replayed. The idempotency check runs before quota and budget checks. On a replay `usage` holds
+        the stored values of the original generation; this request made no model call.
+
+        **`client_metadata`** is an opaque object (the RAG source map). It is accepted only
+        with `generate`, at most 16 KiB as canonical JSON (`422 validation_failed`
+        otherwise). The gateway never reads it. With the hash headers it is stored with the
+        result and the stored object is returned on every replay. Without them there is no
+        record: it is only returned unchanged in the response.
+
+        **Request errors.** A missing or invalid required header, or a body that is not
+        valid JSON, is `400 invalid_request`. A JSON body that breaks a field rule is
+        `422 validation_failed`.
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/XWorkspaceId'
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XRequestDeadlineMs'
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/XIdempotencyKeyHashOptional'
+        - $ref: '#/components/parameters/XIdempotencyRequestHashOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalChatRequest'
+            examples:
+              condense:
+                summary: Rewrite a follow-up question as a standalone query
+                value:
+                  operation: condense
+                  messages:
+                    - role: system
+                      content: Rewrite the last user question as a standalone search query.
+                    - role: user
+                      content: What are the product return conditions?
+                    - role: assistant
+                      content: Returns are possible within 30 days [S1].
+                    - role: user
+                      content: How long does the refund take?
+                  max_output_tokens: 64
+                  temperature: 0
+              generate:
+                summary: Generate a cited answer with a source map
+                value:
+                  operation: generate
+                  messages:
+                    - role: system
+                      content: Answer only from the sources. Cite them as [S1], [S2].
+                    - role: user
+                      content: "[S1] Return policy: refunds are paid within 14 days.\n\nQuestion: How long does the refund take?"
+                  max_output_tokens: 512
+                  client_metadata:
+                    sources:
+                      S1:
+                        document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                        version_id: 0193a0aa-1112-7e55-8d44-0a1b2c3d4e5f
+                        chunk_id: 0193a0aa-2222-7f66-9e55-1b2c3d4e5f60
+                        title_at_generation: Return policy
+      responses:
+        '200':
+          description: 'Model answer, or a committed result replayed (`replayed: true`).'
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalChatResponse'
+              examples:
+                generated:
+                  summary: New answer
+                  value:
+                    content: Refunds are paid within 14 days after the store receives the item [S1].
+                    finish_reason: stop
+                    provider: ollama
+                    model: configured-chat-model
+                    usage:
+                      input_tokens: 2140
+                      output_tokens: 38
+                    usage_source: provider
+                    latency_ms: 2580
+                    replayed: false
+                    client_metadata:
+                      sources:
+                        S1:
+                          document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                          version_id: 0193a0aa-1112-7e55-8d44-0a1b2c3d4e5f
+                          chunk_id: 0193a0aa-2222-7f66-9e55-1b2c3d4e5f60
+                          title_at_generation: Return policy
+                    request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+                condensed:
+                  summary: Condensed query, no idempotency
+                  value:
+                    content: Refund processing time after a product return
+                    finish_reason: stop
+                    provider: ollama
+                    model: configured-condense-model
+                    usage:
+                      input_tokens: 178
+                      output_tokens: 9
+                    usage_source: provider
+                    latency_ms: 405
+                    replayed: false
+                    request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+        '400':
+          $ref: '#/components/responses/InternalBadRequest'
+        '401':
+          $ref: '#/components/responses/InternalUnauthenticated'
+        '402':
+          $ref: '#/components/responses/BudgetExceeded'
+        '409':
+          $ref: '#/components/responses/RequestInProgress'
+        '422':
+          $ref: '#/components/responses/InternalUnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/ProviderError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /internal/v1/generations/lookup:
+    servers: *internalServers
+    get:
+      tags: [internal]
+      operationId: lookupGeneration
+      summary: Look up a stored generation before any paid step
+      description: |
+        Python calls this before retrieval, `condense` and `embed_query` (ADR-009). It is a
+        fast path, not a lock: `generate` repeats the same check. The lookup reserves no
+        budget and is not subject to quotas or rate limits (it never returns `429`), so a
+        committed answer is returned even when the budget is exhausted or a provider is down.
+
+        The gateway finds the record by `(workspace_id, idem_hash)`. A different request
+        hash is `422 idempotency_key_reuse` before the state is inspected. Otherwise:
+
+        | Record | Response |
+        | --- | --- |
+        | `completed` | `200` with the stored result and `client_metadata`, `replayed: true` |
+        | `failed`, final | the stored `502 provider_error`, `retryable: false` |
+        | `processing`, lease not expired | `409 request_in_progress` + `Retry-After` |
+        | none, expired lease, or retryable failure | `404 not_found`: run the full pipeline |
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/XWorkspaceId'
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XRequestDeadlineMs'
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/XIdempotencyKeyHash'
+        - $ref: '#/components/parameters/XIdempotencyRequestHash'
+      responses:
+        '200':
+          description: A committed result for this key.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayedChatResponse'
+              example:
+                content: Refunds are paid within 14 days after the store receives the item [S1].
+                finish_reason: stop
+                provider: ollama
+                model: configured-chat-model
+                usage:
+                  input_tokens: 2140
+                  output_tokens: 38
+                usage_source: provider
+                latency_ms: 4
+                replayed: true
+                client_metadata:
+                  sources:
+                    S1:
+                      document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                      version_id: 0193a0aa-1112-7e55-8d44-0a1b2c3d4e5f
+                      chunk_id: 0193a0aa-2222-7f66-9e55-1b2c3d4e5f60
+                      title_at_generation: Return policy
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2c
+        '400':
+          $ref: '#/components/responses/InternalBadRequest'
+        '401':
+          $ref: '#/components/responses/InternalUnauthenticated'
+        '404':
+          $ref: '#/components/responses/GenerationNotFound'
+        '409':
+          $ref: '#/components/responses/RequestInProgress'
+        '422':
+          $ref: '#/components/responses/LookupKeyReuse'
+        '502':
+          $ref: '#/components/responses/ProviderError'
+        '503':
+          $ref: '#/components/responses/LookupUnavailable'
+        '504':
+          $ref: '#/components/responses/LookupTimeout'
+
+  /internal/v1/embeddings:
+    servers: *internalServers
+    post:
+      tags: [internal]
+      operationId: createEmbeddings
+      summary: Embed texts for search or indexing
+      description: |
+        Embeddings for the RAG service (`embed_query`) and the indexing worker
+        (`embed_document`). The gateway picks the embedding model of the workspace index.
+        It never falls back to another embedding model: other vectors do not match the
+        index (ADR-003), so an unavailable model is `503 provider_unavailable`.
+
+        `vectors[i]` belongs to `texts[i]`. The maximum batch size is a deployment setting
+        enforced at runtime (`422 validation_failed`).
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/XWorkspaceId'
+        - $ref: '#/components/parameters/XRequestId'
+        - $ref: '#/components/parameters/XRequestDeadlineMs'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmbeddingsRequest'
+            example:
+              operation: embed_query
+              texts:
+                - Refund processing time after a product return
+      responses:
+        '200':
+          description: One vector per input text, in input order.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmbeddingsResponse'
+              example:
+                vectors:
+                  - [0.0123, -0.0456, 0.0789, 0.0012]
+                provider: ollama
+                model: configured-embedding-model
+                dimensions: 4
+                usage:
+                  input_tokens: 9
+                  output_tokens: 0
+                usage_source: provider
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+        '400':
+          $ref: '#/components/responses/InternalBadRequest'
+        '401':
+          $ref: '#/components/responses/InternalUnauthenticated'
+        '402':
+          $ref: '#/components/responses/BudgetExceeded'
+        '422':
+          $ref: '#/components/responses/InternalUnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/ProviderError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /internal/health/live:
+    servers: *internalServers
+    get:
+      tags: [health]
+      operationId: getLiveness
+      summary: Liveness probe
+      description: Returns 200 while the process can serve HTTP. Checks no dependencies.
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivenessStatus'
+              example:
+                status: ok
+
+  /internal/health/ready:
+    servers: *internalServers
+    get:
+      tags: [health]
+      operationId: getReadiness
+      summary: Readiness probe
+      description: |
+        Returns 200 when PostgreSQL is reachable: the gateway can then authenticate callers,
+        reserve budgets and replay committed results. Returns 503 otherwise.
+
+        Providers are optional checks: when one is down the gateway stays ready, reports
+        `degraded: true` and routes to the remaining allowed providers.
+      security: []
+      responses:
+        '200':
+          description: Ready to serve traffic, possibly degraded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessReady'
+              examples:
+                healthy:
+                  summary: All dependencies up
+                  value:
+                    status: ready
+                    degraded: false
+                    checks:
+                      postgres: ok
+                      ollama: ok
+                      anthropic: ok
+                providerDown:
+                  summary: One provider unavailable, still ready
+                  value:
+                    status: ready
+                    degraded: true
+                    checks:
+                      postgres: ok
+                      ollama: fail
+                      anthropic: ok
+        '503':
+          description: Not ready. PostgreSQL is unreachable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessNotReady'
+              example:
+                status: not_ready
+                degraded: false
+                checks:
+                  postgres: fail
+                  ollama: ok
+                  anthropic: ok
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: |
+        Application API key, sent by OpenAI clients as `Authorization: Bearer <key>`. The key
+        identifies the application and its workspace; budgets and idempotency keys are
+        scoped by it.
+    serviceToken:
+      type: http
+      scheme: bearer
+      description: |
+        Static service token inside the Compose network (MVP), or a short-lived signed
+        service JWT outside Compose (spec 4.2). Only service tokens may set `X-Workspace-ID`.
+
+  parameters:
+    XRequestId:
+      name: X-Request-ID
+      in: header
+      required: true
+      description: |
+        Request ID (UUID or ULID) from the Go API, or created by the worker. Passed through
+        every hop and log line (ADR-003).
+      schema:
+        $ref: '#/components/schemas/RequestId'
+      example: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+    XRequestIdOptional:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: |
+        Client request ID. Never causes a `400`: proxies such as ingress-nginx set their own
+        IDs in other formats. A UUID or ULID is used as is; an absent value, or any other
+        value, is replaced with an ID the gateway creates. The response header returns the
+        ID that was used.
+      schema:
+        # Plain string on purpose: a pattern here would make validating middleware reject
+        # requests that the description promises to accept.
+        type: string
+      example: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+    XRequestDeadlineMs:
+      name: X-Request-Deadline-Ms
+      in: header
+      required: true
+      description: |
+        Remaining time budget in milliseconds, already minus the caller's margin (spec 4.3).
+        No upper bound in the schema: the maximum is a deployment setting, and a larger value
+        is clamped to it, never rejected. `0` means no time is left after the caller's
+        margin: the gateway answers `504 timeout` at once, without a provider call
+        (`retryable: true`), instead of `400`.
+      schema:
+        type: integer
+        minimum: 0
+      example: 54000
+    XRequestDeadlineMsOptional:
+      name: X-Request-Deadline-Ms
+      in: header
+      required: false
+      description: |
+        Time budget in milliseconds. Without it, or above the configured maximum, the
+        gateway uses the configured maximum.
+      schema:
+        type: integer
+        minimum: 1
+      example: 30000
+    Traceparent:
+      name: traceparent
+      in: header
+      required: false
+      description: |
+        W3C trace context. `X-Request-ID` does not replace it. Not validated by the API:
+        tracing middleware parses it and starts a new trace when the value is invalid.
+      schema:
+        type: string
+      example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-chosen key for safe retries of non-streaming requests (ADR-009). Scoped by
+        the application of the API key
+        (`idem_hash = sha256("api:" || application_id || ":" || key)`); expires after 24 hours.
+        Not allowed with `stream: true` (`400 invalid_request`).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[\x21-\x7E]+$'
+      example: 5f1c2a9e-checkout-retry-1
+    XWorkspaceId:
+      name: X-Workspace-ID
+      in: header
+      required: true
+      description: |
+        Workspace the call is made for. Trusted only with a service token; the gateway
+        scopes budgets, data policy and idempotency records by it.
+      schema:
+        type: string
+        format: uuid
+      example: 0193a0aa-0000-7a10-8d44-0a1b2c3d4e5f
+    XIdempotencyKeyHash:
+      name: X-Idempotency-Key-Hash
+      in: header
+      required: true
+      description: |
+        `sha256(session_id || Idempotency-Key)` as lowercase hex, computed by the Go API and
+        forwarded unchanged by Python (ADR-009).
+      schema:
+        $ref: '#/components/schemas/Sha256Hex'
+      example: 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b
+    XIdempotencyRequestHash:
+      name: X-Idempotency-Request-Hash
+      in: header
+      required: true
+      description: |
+        `sha256` of the canonical JSON of the client request body, as lowercase hex. It comes
+        from the client request, not from the gateway body, because retrieval on a retry may
+        build a different context (ADR-009).
+      schema:
+        $ref: '#/components/schemas/Sha256Hex'
+      example: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+    XIdempotencyKeyHashOptional:
+      name: X-Idempotency-Key-Hash
+      in: header
+      required: false
+      description: |
+        Same as on the lookup. Only with `operation: generate`, and only together with
+        `X-Idempotency-Request-Hash`.
+      schema:
+        $ref: '#/components/schemas/Sha256Hex'
+      example: 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b
+    XIdempotencyRequestHashOptional:
+      name: X-Idempotency-Request-Hash
+      in: header
+      required: false
+      description: |
+        Same as on the lookup. Only with `operation: generate`, and only together with
+        `X-Idempotency-Key-Hash`.
+      schema:
+        $ref: '#/components/schemas/Sha256Hex'
+      example: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
+  headers:
+    XRequestId:
+      required: true
+      description: The request ID from the request header, or the one the gateway created.
+      schema:
+        $ref: '#/components/schemas/RequestId'
+      example: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+    XShouldRetry:
+      required: true
+      description: |
+        Equal to `error.retryable`. The OpenAI SDKs obey it instead of their status-code
+        retry rules, so they never repeat a request that cannot succeed.
+      schema:
+        type: string
+        enum: ['true', 'false']
+      example: 'false'
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        minimum: 0
+      example: 5
+
+  schemas:
+    Sha256Hex:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+
+    RequestId:
+      type: string
+      description: UUID or ULID (spec 4.2).
+      anyOf:
+        - pattern: '^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$'
+        - pattern: '^[0-7][0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{25}$'
+
+    # --- Public: OpenAI-compatible subset -------------------------------------------------
+
+    ChatCompletionRequest:
+      type: object
+      # Closed on purpose: unknown fields (tools, response_format, ...) must fail loudly
+      # with 400 unsupported_parameter, not be ignored.
+      additionalProperties: false
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Model alias allowed for the application. Unknown → `404 model_not_found`.
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        stream:
+          type: [boolean, 'null']
+          default: false
+        stream_options:
+          type: [object, 'null']
+          additionalProperties: false
+          description: 'Only with `stream: true`.'
+          properties:
+            include_usage:
+              type: boolean
+              default: false
+              description: Send one extra chunk with the usage of the whole request before `[DONE]`.
+        max_completion_tokens:
+          type: [integer, 'null']
+          minimum: 1
+          description: Upper bound on generated tokens. The maximum is a deployment setting.
+        max_tokens:
+          type: [integer, 'null']
+          minimum: 1
+          deprecated: true
+          description: Legacy alias of `max_completion_tokens`. Sending both is `400`.
+        temperature:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+        n:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 1
+          description: Only `1` is supported.
+        stop:
+          type: [string, array, 'null']
+          minLength: 1
+          minItems: 1
+          maxItems: 4
+          items:
+            type: string
+            minLength: 1
+        presence_penalty:
+          type: [number, 'null']
+          minimum: -2
+          maximum: 2
+        frequency_penalty:
+          type: [number, 'null']
+          minimum: -2
+          maximum: 2
+        seed:
+          type: [integer, 'null']
+        user:
+          type: [string, 'null']
+          maxLength: 256
+          description: End-user ID for abuse tracking. Stored with usage, never sent to providers.
+        # No-op values of unsupported features. Many OpenAI-compatible clients send them by
+        # default; rejecting them would break the "change only the base URL" goal (ADR-013).
+        tools:
+          type: [array, 'null']
+          maxItems: 0
+          description: Only an empty list. Tool calling is not supported.
+        tool_choice:
+          enum: [none, null]
+          description: Only `none`.
+        parallel_tool_calls:
+          type: [boolean, 'null']
+          description: Accepted and ignored; it has no effect without tools.
+        response_format:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [type]
+          description: 'Only `{type: text}`. Structured output is not supported.'
+          properties:
+            type:
+              type: string
+              const: text
+        logprobs:
+          enum: [false, null]
+          description: Only `false`. Log probabilities are not returned.
+        store:
+          enum: [false, null]
+          description: Only `false`. The gateway does not store completions for clients.
+
+    ChatMessage:
+      type: object
+      additionalProperties: false
+      required: [role, content]
+      description: |
+        Text-only message. `developer` is mapped to the provider's system role. Image, audio
+        and tool parts are not supported.
+      properties:
+        role:
+          type: string
+          enum: [system, developer, user, assistant]
+        content:
+          type: [string, array]
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/TextContentPart'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+
+    TextContentPart:
+      type: object
+      additionalProperties: false
+      required: [type, text]
+      properties:
+        type:
+          type: string
+          const: text
+        text:
+          type: string
+
+    ChatCompletion:
+      type: object
+      additionalProperties: false
+      required: [id, object, created, model, choices, usage]
+      properties:
+        id:
+          type: string
+          description: |
+            `chatcmpl-` + the ID of the stored generation, created by the gateway (not the
+            client's `X-Request-ID`). Unique across requests and the same on a replay.
+        object:
+          type: string
+          const: chat.completion
+        created:
+          type: integer
+          description: Unix time in seconds when the completion was created.
+        model:
+          type: string
+          description: The model alias from the request.
+        choices:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items:
+            $ref: '#/components/schemas/ChatCompletionChoice'
+        usage:
+          $ref: '#/components/schemas/CompletionUsage'
+
+    ChatCompletionChoice:
+      type: object
+      additionalProperties: false
+      required: [index, message, finish_reason, logprobs]
+      properties:
+        index:
+          type: integer
+          const: 0
+        message:
+          type: object
+          additionalProperties: false
+          required: [role, content]
+          properties:
+            role:
+              type: string
+              const: assistant
+            content:
+              type: string
+        finish_reason:
+          $ref: '#/components/schemas/FinishReason'
+        logprobs:
+          type: 'null'
+
+    ChatCompletionChunk:
+      type: object
+      additionalProperties: false
+      required: [id, object, created, model, choices]
+      description: |
+        One SSE `data:` payload. With `include_usage`, every chunk has `usage: null` except
+        the extra last chunk, which has empty `choices` and the usage of the whole request.
+      properties:
+        id:
+          type: string
+          description: Same for every chunk of one response.
+        object:
+          type: string
+          const: chat.completion.chunk
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          maxItems: 1
+          items:
+            $ref: '#/components/schemas/ChatCompletionChunkChoice'
+        usage:
+          anyOf:
+            - $ref: '#/components/schemas/CompletionUsage'
+            - type: 'null'
+
+    ChatCompletionChunkChoice:
+      type: object
+      additionalProperties: false
+      required: [index, delta, finish_reason]
+      properties:
+        index:
+          type: integer
+          const: 0
+        delta:
+          type: object
+          additionalProperties: false
+          properties:
+            role:
+              type: string
+              const: assistant
+            content:
+              type: string
+        finish_reason:
+          description: '`null` until the last content chunk.'
+          anyOf:
+            - $ref: '#/components/schemas/FinishReason'
+            - type: 'null'
+
+    FinishReason:
+      type: string
+      enum: [stop, length, content_filter]
+
+    CompletionUsage:
+      type: object
+      additionalProperties: false
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      description: On a replay, the stored usage of the original generation.
+      properties:
+        prompt_tokens:
+          type: integer
+          minimum: 0
+        completion_tokens:
+          type: integer
+          minimum: 0
+        total_tokens:
+          type: integer
+          minimum: 0
+
+    # --- Internal ----------------------------------------------------------------------------
+
+    InternalChatRequest:
+      type: object
+      additionalProperties: false
+      required: [operation, messages, max_output_tokens]
+      properties:
+        operation:
+          type: string
+          enum: [condense, generate]
+          description: Selects the model, budget category and usage label (ADR-003).
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/InternalChatMessage'
+        max_output_tokens:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        client_metadata:
+          $ref: '#/components/schemas/ClientMetadata'
+
+    InternalChatMessage:
+      type: object
+      additionalProperties: false
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant]
+        content:
+          type: string
+          minLength: 1
+
+    ClientMetadata:
+      type: object
+      additionalProperties: true
+      description: |
+        Opaque caller data (ADR-009). Only with `generate`; at most 16 KiB as canonical JSON.
+        The gateway never reads it. With idempotency headers it is stored with the result and
+        returned on every replay; without them it is only returned unchanged in the response.
+
+    InternalChatResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - content
+        - finish_reason
+        - provider
+        - model
+        - usage
+        - usage_source
+        - latency_ms
+        - replayed
+        - request_id
+      properties:
+        content:
+          type: string
+        finish_reason:
+          $ref: '#/components/schemas/FinishReason'
+        provider:
+          type: string
+          description: Provider that produced the content.
+        model:
+          type: string
+          description: Provider model that produced the content.
+        usage:
+          $ref: '#/components/schemas/TokenUsage'
+        usage_source:
+          $ref: '#/components/schemas/UsageSource'
+        latency_ms:
+          type: integer
+          minimum: 0
+          description: Time this call spent in the gateway. Small on a replay.
+        replayed:
+          type: boolean
+          description: |
+            `true` when the result was committed by an earlier request with the same key.
+            This request then made no model call; `usage` is the stored original usage.
+        client_metadata:
+          $ref: '#/components/schemas/ClientMetadata'
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+
+    ReplayedChatResponse:
+      description: A committed result returned by the lookup.
+      allOf:
+        - $ref: '#/components/schemas/InternalChatResponse'
+        - properties:
+            replayed:
+              const: true
+
+    EmbeddingsRequest:
+      type: object
+      additionalProperties: false
+      required: [operation, texts]
+      properties:
+        operation:
+          type: string
+          enum: [embed_query, embed_document]
+        texts:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            minLength: 1
+
+    EmbeddingsResponse:
+      type: object
+      additionalProperties: false
+      required: [vectors, provider, model, dimensions, usage, usage_source, request_id]
+      properties:
+        vectors:
+          type: array
+          minItems: 1
+          description: '`vectors[i]` is the embedding of `texts[i]`; each has `dimensions` items.'
+          items:
+            type: array
+            minItems: 1
+            items:
+              type: number
+        provider:
+          type: string
+        model:
+          type: string
+        dimensions:
+          type: integer
+          minimum: 1
+        usage:
+          $ref: '#/components/schemas/TokenUsage'
+        usage_source:
+          $ref: '#/components/schemas/UsageSource'
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+
+    TokenUsage:
+      type: object
+      additionalProperties: false
+      required: [input_tokens, output_tokens]
+      properties:
+        input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        cache_write_tokens:
+          type: integer
+          minimum: 0
+          default: 0
+        cache_read_tokens:
+          type: integer
+          minimum: 0
+          default: 0
+
+    UsageSource:
+      type: string
+      enum: [provider, estimated, unknown]
+      description: |
+        `provider`: reported by the provider. `estimated`: the provider reported nothing and
+        the gateway stored an estimate (ADR-004). `unknown`: no usage could be determined.
+
+    # --- Health ------------------------------------------------------------------------------
+
+    LivenessStatus:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+
+    ReadinessReady:
+      type: object
+      additionalProperties: false
+      required: [status, degraded, checks]
+      properties:
+        status:
+          type: string
+          const: ready
+        degraded:
+          type: boolean
+          description: '`true` when a provider check fails.'
+        checks:
+          $ref: '#/components/schemas/ReadyChecks'
+
+    ReadinessNotReady:
+      type: object
+      additionalProperties: false
+      required: [status, degraded, checks]
+      properties:
+        status:
+          type: string
+          const: not_ready
+        degraded:
+          type: boolean
+          description: '`true` when a provider check fails.'
+        checks:
+          $ref: '#/components/schemas/NotReadyChecks'
+
+    ReadinessChecks:
+      type: object
+      description: |
+        Result of each dependency check, keyed by name. `postgres` is required for readiness;
+        provider checks (keyed by provider name) are optional.
+      required: [postgres]
+      properties:
+        postgres:
+          $ref: '#/components/schemas/CheckResult'
+      additionalProperties:
+        $ref: '#/components/schemas/CheckResult'
+
+    ReadyChecks:
+      description: PostgreSQL is up. Provider checks may fail.
+      allOf:
+        - $ref: '#/components/schemas/ReadinessChecks'
+        - properties:
+            postgres:
+              const: ok
+
+    NotReadyChecks:
+      description: PostgreSQL is down.
+      allOf:
+        - $ref: '#/components/schemas/ReadinessChecks'
+        - properties:
+            postgres:
+              const: fail
+
+    CheckResult:
+      type: string
+      enum: [ok, fail]
+
+    # --- Errors ------------------------------------------------------------------------------
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error, request_id]
+      description: Unified error contract (spec 7.4), readable by OpenAI clients.
+      properties:
+        error:
+          $ref: '#/components/schemas/Error'
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+
+    Error:
+      type: object
+      additionalProperties: false
+      required: [message, type, code, param, retryable]
+      properties:
+        message:
+          type: string
+          description: Human-readable text. Never contains secrets or message content.
+        type:
+          type: string
+          description: OpenAI-style error class, derived from the status.
+          enum:
+            - invalid_request_error
+            - authentication_error
+            - insufficient_quota
+            - rate_limit_error
+            - api_error
+            - timeout_error
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - unsupported_parameter
+            - unauthenticated
+            - model_not_found
+            - not_found
+            - request_in_progress
+            - validation_failed
+            - idempotency_key_reuse
+            - budget_exceeded
+            - rate_limited
+            - provider_error
+            - provider_unavailable
+            - dependency_unavailable
+            - timeout
+        param:
+          type: [string, 'null']
+          description: Request field or header that caused the error, otherwise `null`.
+        retryable:
+          type: boolean
+          description: |
+            Whether repeating the same request can succeed. Sent as `x-should-retry` too.
+        details:
+          type: object
+          description: Optional machine-readable context, for example invalid fields.
+          additionalProperties: true
+
+  responses:
+    PublicBadRequest:
+      description: |
+        Invalid JSON, header or field, an unsupported parameter, or `stream: true` with
+        `Idempotency-Key`.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unsupportedParameter:
+              summary: Tool calling is not supported
+              value:
+                error:
+                  message: 'Unsupported parameter: tools'
+                  type: invalid_request_error
+                  code: unsupported_parameter
+                  param: tools
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            tooManyChoices:
+              summary: n greater than 1
+              value:
+                error:
+                  message: Only n = 1 is supported
+                  type: invalid_request_error
+                  code: unsupported_parameter
+                  param: n
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            invalidField:
+              summary: Field rule broken
+              value:
+                error:
+                  message: temperature must be between 0 and 2
+                  type: invalid_request_error
+                  code: invalid_request
+                  param: temperature
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            streamWithIdempotencyKey:
+              summary: Streams cannot be idempotent in Phase 1
+              value:
+                error:
+                  message: Idempotency-Key is not supported with stream=true
+                  type: invalid_request_error
+                  code: invalid_request
+                  param: Idempotency-Key
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    InternalBadRequest:
+      description: Missing or invalid header, or a body that is not valid JSON.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            missingHeader:
+              summary: Required header missing
+              value:
+                error:
+                  message: Header X-Workspace-ID is required
+                  type: invalid_request_error
+                  code: invalid_request
+                  param: X-Workspace-ID
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            singleHashHeader:
+              summary: Only one idempotency hash header sent
+              value:
+                error:
+                  message: X-Idempotency-Key-Hash and X-Idempotency-Request-Hash must be sent together
+                  type: invalid_request_error
+                  code: invalid_request
+                  param: X-Idempotency-Request-Hash
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    PublicUnauthenticated:
+      description: Missing or invalid application API key.
+      headers:
+        # RFC 9110 15.5.2: a 401 must carry a challenge for the expected scheme.
+        WWW-Authenticate:
+          required: true
+          description: Authentication challenge for the API key scheme.
+          schema:
+            type: string
+          example: Bearer
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: API key is missing or invalid
+              type: authentication_error
+              code: unauthenticated
+              param: null
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    InternalUnauthenticated:
+      description: Missing or invalid service token.
+      headers:
+        # RFC 9110 15.5.2: a 401 must carry a challenge for the expected scheme.
+        WWW-Authenticate:
+          required: true
+          description: Authentication challenge for the service token scheme.
+          schema:
+            type: string
+          example: Bearer
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: Service token is missing or invalid
+              type: authentication_error
+              code: unauthenticated
+              param: null
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    BudgetExceeded:
+      description: |
+        The workspace or application budget is exhausted. Checked after the idempotency
+        check, so it never hides a committed result.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: The budget for this workspace is exhausted
+              type: insufficient_quota
+              code: budget_exceeded
+              param: null
+              retryable: false
+              details:
+                scope: workspace
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    ModelNotFound:
+      description: The model alias does not exist or is not allowed for this application.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: The model 'gpt-unknown' does not exist or you do not have access to it
+              type: invalid_request_error
+              code: model_not_found
+              param: model
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    GenerationNotFound:
+      description: |
+        No usable record: none, an expired lease, or a retryable failure. Python runs the
+        full pipeline.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: No stored generation for this key
+              type: invalid_request_error
+              code: not_found
+              param: null
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    RequestInProgress:
+      description: |
+        Another handler holds a live lease for this idempotency key. Retry after
+        `Retry-After` seconds with the same key.
+      headers:
+        # Required here (optional elsewhere): callers must know when to retry the same key.
+        Retry-After:
+          required: true
+          description: Seconds to wait before retrying with the same idempotency key.
+          schema:
+            type: integer
+            minimum: 0
+          example: 5
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: A request with this idempotency key is still being processed
+              type: invalid_request_error
+              code: request_in_progress
+              param: null
+              retryable: true
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    IdempotencyKeyReuse:
+      description: The idempotency key was already used with a different request.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: This idempotency key was already used with a different request
+              type: invalid_request_error
+              code: idempotency_key_reuse
+              param: Idempotency-Key
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    LookupKeyReuse:
+      description: The idempotency key hash was already used with another request hash.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: This idempotency key was already used with a different request
+              type: invalid_request_error
+              code: idempotency_key_reuse
+              param: X-Idempotency-Request-Hash
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    LookupUnavailable:
+      description: |
+        PostgreSQL is unreachable. The lookup never calls a provider, so a retry costs
+        nothing: always `retryable: true`.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: A required dependency is unavailable
+              type: api_error
+              code: dependency_unavailable
+              param: null
+              retryable: true
+              details:
+                dependency: postgres
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    LookupTimeout:
+      description: |
+        The deadline expired during the lookup. No provider was called, so a retry costs
+        nothing: always `retryable: true`.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: The request deadline expired
+              type: timeout_error
+              code: timeout
+              param: null
+              retryable: true
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    InternalUnprocessableEntity:
+      description: |
+        Body breaks a field rule or a runtime limit, or the idempotency key was reused with
+        another request hash.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            validationFailed:
+              summary: client_metadata too large
+              value:
+                error:
+                  message: client_metadata exceeds 16 KiB
+                  type: invalid_request_error
+                  code: validation_failed
+                  param: client_metadata
+                  retryable: false
+                  details:
+                    max_bytes: 16384
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            idempotencyKeyReuse:
+              summary: Same key, different request hash
+              value:
+                error:
+                  message: This idempotency key was already used with a different request
+                  type: invalid_request_error
+                  code: idempotency_key_reuse
+                  param: X-Idempotency-Request-Hash
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    RateLimited:
+      description: Application, workspace or provider rate limit hit.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: Too many requests, retry later
+              type: rate_limit_error
+              code: rate_limited
+              param: null
+              retryable: true
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    ProviderError:
+      description: |
+        The provider rejected the call and no fallback applies. The only final failure: on an
+        idempotent request it is stored and replayed as `502` until the key expires.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: The model provider returned an error
+              type: api_error
+              code: provider_error
+              param: null
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    ServiceUnavailable:
+      description: |
+        No allowed provider is available (`provider_unavailable`), or PostgreSQL is down
+        (`dependency_unavailable`).
+
+        `retryable` is `true` only when no provider attempt was sent. If an attempt with an
+        unknown outcome (timeout, connection reset) was sent and every fallback is
+        unavailable, the first attempt may have been billed, so `retryable` is `false`, with
+        or without an idempotency key: the record is then a retryable failure, and a retry
+        with the same key takes it over and calls the provider again (ADR-009). The client
+        may still retry on purpose. Same rule as `504`.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            providerUnavailable:
+              summary: All allowed providers are unavailable, no attempt sent
+              value:
+                error:
+                  message: The model service is temporarily unavailable
+                  type: api_error
+                  code: provider_unavailable
+                  param: null
+                  retryable: true
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            unknownAttempt:
+              summary: First attempt may have been billed, so no automatic retry
+              value:
+                error:
+                  message: The model service is temporarily unavailable
+                  type: api_error
+                  code: provider_unavailable
+                  param: null
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            dependencyUnavailable:
+              summary: PostgreSQL is unreachable
+              value:
+                error:
+                  message: A required dependency is unavailable
+                  type: api_error
+                  code: dependency_unavailable
+                  param: null
+                  retryable: true
+                  details:
+                    dependency: postgres
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    Timeout:
+      description: |
+        The deadline expired. `retryable` is `true` only if no provider attempt was sent
+        (the deadline expired before the call, or `X-Request-Deadline-Ms: 0`). If an attempt
+        was sent, its outcome is unknown and the provider may have billed it, so `retryable`
+        is `false`, with or without an idempotency key: the record is then a retryable
+        failure, and a retry with the same key takes it over and calls the provider again
+        (ADR-009). The client may still retry on purpose.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        x-should-retry:
+          $ref: '#/components/headers/XShouldRetry'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            afterProviderAttempt:
+              summary: Provider attempt sent, a retry would pay again
+              value:
+                error:
+                  message: The request deadline expired
+                  type: timeout_error
+                  code: timeout
+                  param: null
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            beforeProviderAttempt:
+              summary: Deadline expired before any provider call
+              value:
+                error:
+                  message: The request deadline expired
+                  type: timeout_error
+                  code: timeout
+                  param: null
+                  retryable: true
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
