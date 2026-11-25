@@ -1,3 +1,4 @@
+import asyncio
 import math
 import time
 import uuid
@@ -8,6 +9,8 @@ from ai_service.gateway import (
     CallContext,
     ChatMessage,
     ChatRequest,
+    ChatResult,
+    EmbeddingResult,
     EmbedRequest,
     FakeGatewayClient,
     GatewayClient,
@@ -17,15 +20,24 @@ from ai_service.gateway import (
 from ai_service.gateway.fake import FAKE_ANSWER, fake_vector
 from ai_service.gateway.models import DEFAULT_DEADLINE_MARGIN_MS
 
-WORKSPACE_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+def _embed_request(context: CallContext, *texts: str) -> EmbedRequest:
+    return EmbedRequest(context=context, operation=Operation.EMBED_QUERY, texts=list(texts))
 
 
-def _context(timeout_s: float = 30.0) -> CallContext:
-    return CallContext.with_timeout(WORKSPACE_ID, "req-1", timeout_s)
-
-
-def _embed_request(*texts: str) -> EmbedRequest:
-    return EmbedRequest(context=_context(), operation=Operation.EMBED_QUERY, texts=list(texts))
+async def _call(
+    client: GatewayClient, call: str, context: CallContext
+) -> ChatResult | EmbeddingResult:
+    if call == "chat":
+        return await client.chat(
+            ChatRequest(
+                context=context,
+                operation=Operation.GENERATE,
+                messages=[ChatMessage(role="user", content="hi")],
+                max_output_tokens=16,
+            )
+        )
+    return await client.embed(_embed_request(context, "hi"))
 
 
 def test_fake_satisfies_protocol() -> None:
@@ -40,9 +52,11 @@ def test_fake_vector_golden_value() -> None:
     assert vector[:4] == pytest.approx(expected_prefix, abs=1e-6)
 
 
-async def test_embed_same_input_same_output() -> None:
-    first = await FakeGatewayClient().embed(_embed_request("hello world", "second text"))
-    second = await FakeGatewayClient().embed(_embed_request("hello world", "second text"))
+async def test_embed_same_input_same_output(call_context: CallContext) -> None:
+    # Two separate clients: determinism must not depend on per-instance state.
+    request = _embed_request(call_context, "hello world", "second text")
+    first = await FakeGatewayClient().embed(request)
+    second = await FakeGatewayClient().embed(request)
     assert first.vectors == second.vectors
 
 
@@ -54,40 +68,46 @@ async def test_embed_same_input_same_output() -> None:
         ("", " "),
     ],
 )
-async def test_embed_different_input_different_output(text_a: str, text_b: str) -> None:
-    result = await FakeGatewayClient().embed(_embed_request(text_a, text_b))
+async def test_embed_different_input_different_output(
+    fake_client: FakeGatewayClient, call_context: CallContext, text_a: str, text_b: str
+) -> None:
+    result = await fake_client.embed(_embed_request(call_context, text_a, text_b))
     assert result.vectors[0] != result.vectors[1]
 
 
 @pytest.mark.parametrize("dimensions", [1, 8, 16, 1536])
-async def test_embed_dimensions_and_unit_norm(dimensions: int) -> None:
-    result = await FakeGatewayClient(dimensions=dimensions).embed(_embed_request("text"))
+async def test_embed_dimensions_and_unit_norm(call_context: CallContext, dimensions: int) -> None:
+    client = FakeGatewayClient(dimensions=dimensions)
+    result = await client.embed(_embed_request(call_context, "text"))
     assert result.dimensions == dimensions
     assert len(result.vectors[0]) == dimensions
     assert math.sqrt(sum(v * v for v in result.vectors[0])) == pytest.approx(1.0)
 
 
-async def test_embed_keeps_input_order() -> None:
-    result = await FakeGatewayClient().embed(_embed_request("one", "two", "three"))
+async def test_embed_keeps_input_order(
+    fake_client: FakeGatewayClient, call_context: CallContext
+) -> None:
+    result = await fake_client.embed(_embed_request(call_context, "one", "two", "three"))
     assert result.vectors == [fake_vector(t, 16) for t in ("one", "two", "three")]
 
 
-async def test_chat_returns_fixed_answer_with_citation() -> None:
-    client = FakeGatewayClient()
+async def test_chat_returns_fixed_answer_with_citation(
+    fake_client: FakeGatewayClient, call_context: CallContext
+) -> None:
     request = ChatRequest(
-        context=_context(),
+        context=call_context,
         operation=Operation.GENERATE,
         messages=[ChatMessage(role="user", content="What is the refund policy?")],
         max_output_tokens=256,
     )
 
-    first = await client.chat(request)
-    second = await client.chat(request)
+    first = await fake_client.chat(request)
+    second = await fake_client.chat(request)
 
     assert "[S1]" in first.content
     assert first == second
     assert first.usage.input_tokens == 5
-    assert client.calls == [request, request]
+    assert fake_client.calls == [request, request]
 
 
 ANSWER_WORDS = len(FAKE_ANSWER.split())
@@ -104,16 +124,21 @@ ANSWER_WORDS = len(FAKE_ANSWER.split())
     ids=["one-token", "cut-before-citation", "exact", "large-limit"],
 )
 async def test_chat_honours_max_output_tokens(
-    max_output_tokens: int, want_content: str, want_tokens: int, want_finish: str
+    fake_client: FakeGatewayClient,
+    call_context: CallContext,
+    max_output_tokens: int,
+    want_content: str,
+    want_tokens: int,
+    want_finish: str,
 ) -> None:
     request = ChatRequest(
-        context=_context(),
+        context=call_context,
         operation=Operation.GENERATE,
         messages=[ChatMessage(role="user", content="hi")],
         max_output_tokens=max_output_tokens,
     )
 
-    result = await FakeGatewayClient().chat(request)
+    result = await fake_client.chat(request)
 
     assert result.content == want_content
     assert result.usage.output_tokens == want_tokens
@@ -126,29 +151,49 @@ async def test_chat_honours_max_output_tokens(
     [0.0, DEFAULT_DEADLINE_MARGIN_MS / 1000 / 2],
     ids=["expired", "less-than-margin"],
 )
-async def test_no_gateway_budget_raises_timeout(call: str, remaining_s: float) -> None:
-    client = FakeGatewayClient()
+async def test_no_gateway_budget_raises_timeout(
+    fake_client: FakeGatewayClient, workspace_id: uuid.UUID, call: str, remaining_s: float
+) -> None:
     expired = CallContext(
-        workspace_id=WORKSPACE_ID, request_id="req-2", deadline=time.monotonic() + remaining_s
+        workspace_id=workspace_id, request_id="req-2", deadline=time.monotonic() + remaining_s
     )
 
     with pytest.raises(GatewayTimeoutError) as exc_info:
-        if call == "chat":
-            await client.chat(
-                ChatRequest(
-                    context=expired,
-                    operation=Operation.GENERATE,
-                    messages=[ChatMessage(role="user", content="hi")],
-                    max_output_tokens=16,
-                )
-            )
-        else:
-            await client.embed(
-                EmbedRequest(context=expired, operation=Operation.EMBED_QUERY, texts=["hi"])
-            )
+        await _call(fake_client, call, expired)
 
     assert exc_info.value.retryable is True
     assert exc_info.value.request_id == "req-2"
+
+
+@pytest.mark.parametrize("call", ["chat", "embed"])
+async def test_cancelled_call_propagates_and_records_nothing(
+    fake_client: FakeGatewayClient, call_context: CallContext, call: str
+) -> None:
+    # A task cancelled before its first step never runs: the caller sees CancelledError
+    # and the fake must not report a request that was never sent.
+    task = asyncio.create_task(_call(fake_client, call, call_context))
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake_client.calls == []
+
+
+async def test_cancelling_queued_chat_allows_queued_embed_to_finish(
+    fake_client: FakeGatewayClient, call_context: CallContext
+) -> None:
+    # Neither task has started when chat is cancelled, so this covers queued calls only.
+    # In-flight cancellation needs a real I/O wait: it belongs to the HTTP client tests.
+    cancelled = asyncio.create_task(_call(fake_client, "chat", call_context))
+    kept = asyncio.create_task(_call(fake_client, "embed", call_context))
+    cancelled.cancel()
+
+    results = await asyncio.gather(cancelled, kept, return_exceptions=True)
+
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert isinstance(results[1], EmbeddingResult)
+    assert [type(r) for r in fake_client.calls] == [EmbedRequest]
 
 
 def test_fake_rejects_non_positive_dimensions() -> None:
