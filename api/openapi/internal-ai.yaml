@@ -158,8 +158,10 @@ paths:
         | same request hash, still running | `409 request_in_progress` + `Retry-After` |
         | different request hash | `422 idempotency_key_reuse` |
 
-        Python passes `409` up unchanged; the Go API returns it to the client with
-        `Retry-After` and does not change its own key state.
+        Python passes `409` up with the same status, `code`, `retryable` and `Retry-After`,
+        rebuilt in this file's error format (gateway errors carry extra fields, see
+        `gateway.yaml`); the Go API returns it to the client with `Retry-After` and does not
+        change its own key state.
 
         **Deadline.** If the deadline expires, Python stops local work and returns
         `504 timeout`. The provider may still finish and bill the call (spec 4.3).

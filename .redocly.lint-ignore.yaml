@@ -4,3 +4,7 @@ api/openapi/internal-ai.yaml:
   operation-4xx-response:
     - '#/paths/~1internal~1health~1live/get/responses'
     - '#/paths/~1internal~1health~1ready/get/responses'
+api/openapi/gateway.yaml:
+  operation-4xx-response:
+    - '#/paths/~1internal~1health~1live/get/responses'
+    - '#/paths/~1internal~1health~1ready/get/responses'
