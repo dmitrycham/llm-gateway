@@ -19,18 +19,7 @@ from ai_service.gateway.models import (
     HEADER_REQUEST_ID,
 )
 
-WORKSPACE_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
-
-NOW = 1_000.0
-
-
-@pytest.fixture
-def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("ai_service.gateway.models.monotonic", lambda: NOW)
-
-
-@pytest.mark.usefixtures("frozen_clock")
 @pytest.mark.parametrize(
     ("remaining_s", "want_deadline_ms"),
     [
@@ -42,8 +31,12 @@ def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     ],
     ids=["normal", "just-above-margin", "equal-to-margin", "below-margin", "already-expired"],
 )
-def test_headers_keep_safety_margin(remaining_s: float, want_deadline_ms: str) -> None:
-    context = CallContext(workspace_id=WORKSPACE_ID, request_id="req-1", deadline=NOW + remaining_s)
+def test_headers_keep_safety_margin(
+    frozen_clock: float, workspace_id: uuid.UUID, remaining_s: float, want_deadline_ms: str
+) -> None:
+    context = CallContext(
+        workspace_id=workspace_id, request_id="req-1", deadline=frozen_clock + remaining_s
+    )
 
     headers = context.headers()
 
@@ -51,28 +44,30 @@ def test_headers_keep_safety_margin(remaining_s: float, want_deadline_ms: str) -
     assert headers[HEADER_DEADLINE_MS] == want_deadline_ms
 
 
-@pytest.mark.usefixtures("frozen_clock")
-def test_headers_custom_margin() -> None:
-    context = CallContext(workspace_id=WORKSPACE_ID, request_id="req-1", deadline=NOW + 1.0)
+def test_headers_custom_margin(frozen_clock: float, workspace_id: uuid.UUID) -> None:
+    context = CallContext(
+        workspace_id=workspace_id, request_id="req-1", deadline=frozen_clock + 1.0
+    )
 
     assert context.headers(margin_ms=200)[HEADER_DEADLINE_MS] == "800"
 
 
-@pytest.mark.usefixtures("frozen_clock")
 @pytest.mark.parametrize("deadline_offset_s", [-5.0, 10.0], ids=["expired", "active"])
-def test_negative_margin_is_rejected(deadline_offset_s: float) -> None:
+def test_negative_margin_is_rejected(
+    frozen_clock: float, workspace_id: uuid.UUID, deadline_offset_s: float
+) -> None:
     context = CallContext(
-        workspace_id=WORKSPACE_ID, request_id="req-1", deadline=NOW + deadline_offset_s
+        workspace_id=workspace_id, request_id="req-1", deadline=frozen_clock + deadline_offset_s
     )
 
     with pytest.raises(ValueError, match="margin_ms"):
         context.headers(margin_ms=-1)
 
 
-@pytest.mark.usefixtures("frozen_clock")
-def test_expired_uses_raw_deadline() -> None:
-    assert CallContext(workspace_id=WORKSPACE_ID, request_id="r", deadline=NOW).expired()
-    assert not CallContext(workspace_id=WORKSPACE_ID, request_id="r", deadline=NOW + 1).expired()
+def test_expired_uses_raw_deadline(frozen_clock: float, workspace_id: uuid.UUID) -> None:
+    now = frozen_clock
+    assert CallContext(workspace_id=workspace_id, request_id="r", deadline=now).expired()
+    assert not CallContext(workspace_id=workspace_id, request_id="r", deadline=now + 1).expired()
 
 
 @pytest.mark.parametrize(
@@ -108,11 +103,11 @@ def test_expired_uses_raw_deadline() -> None:
         "embed-unknown-field",
     ],
 )
-def test_invalid_requests_are_rejected(model: type[Any], fields: dict[str, Any]) -> None:
-    context = CallContext.with_timeout(WORKSPACE_ID, "req-1", timeout_s=10)
-
+def test_invalid_requests_are_rejected(
+    call_context: CallContext, model: type[Any], fields: dict[str, Any]
+) -> None:
     with pytest.raises(ValidationError):
-        model(context=context, **fields)
+        model(context=call_context, **fields)
 
 
 def test_embedding_result_rejects_wrong_dimensions() -> None:
@@ -125,3 +120,10 @@ def test_embedding_result_rejects_wrong_dimensions() -> None:
             usage=Usage(input_tokens=2),
             usage_source="estimated",
         )
+
+
+def test_call_context_fixture_uses_frozen_clock(
+    call_context: CallContext, frozen_clock: float
+) -> None:
+    # call_context is requested first on purpose: the deadline must still use the frozen clock.
+    assert call_context.deadline == frozen_clock + 30.0

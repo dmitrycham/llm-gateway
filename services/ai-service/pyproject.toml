@@ -13,6 +13,7 @@ dev = [
     "mypy>=1.18",
     "pytest>=8.4",
     "pytest-asyncio>=1.4",
+    "pytest-cov>=7.1.0",
     "ruff>=0.17",
 ]
 
@@ -56,5 +57,13 @@ warn_required_dynamic_aliases = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers"]
+addopts = ["-ra", "--strict-markers", "--cov=ai_service", "--cov-report=term-missing"]
 asyncio_mode = "auto"
+# Explicit value silences the pytest-asyncio deprecation warning; each test gets a fresh loop.
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 80
