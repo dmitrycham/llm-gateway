@@ -11,3 +11,15 @@ api/openapi/gateway.yaml:
 api/openapi/public.yaml:
   operation-4xx-response:
     - '#/paths/~1health~1live/get/responses'
+    - '#/paths/~1health~1ready/get/responses'
+  # The rule does not see the parent's `properties` from inside an if/then branch; every
+  # name below is defined on the parent schema.
+  no-required-schema-properties-undefined:
+    - '#/components/schemas/MessageResult/allOf/0/then/required/0'
+    - '#/components/schemas/MessageResult/allOf/0/then/required/1'
+    - '#/components/schemas/MessageResult/allOf/0/then/required/2'
+    - '#/components/schemas/MessageResult/allOf/0/then/required/3'
+    - '#/components/schemas/MessageResult/allOf/1/then/required/0'
+    - '#/components/schemas/HistoryMessage/allOf/0/then/required/0'
+    - '#/components/schemas/HistoryMessage/allOf/0/then/required/1'
+    - '#/components/schemas/HistoryMessage/allOf/1/then/required/0'
