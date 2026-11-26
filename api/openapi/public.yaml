@@ -1,30 +1,60 @@
 openapi: 3.1.0
 info:
   title: Go API public and admin API
-  version: 0.1.0
+  version: 0.2.0
   summary: Public, widget and admin API of the Go API.
   description: |
     Public and admin API of the Go API (spec §7.1). This file is the source of truth
     (ADR-005): every endpoint is defined here before it is implemented.
 
-    For now it holds only the liveness probe; the widget, session and admin endpoints come
-    with LGW-25.
-
     **Request ID.** Every response carries `X-Request-ID`, a UUIDv7 the Go API creates for
     each request. The Go API is the entry point, so it ignores any client value (spec §4.2,
-    ADR-001) and passes the ID through every hop and log line.
+    ADR-001) and passes the ID through every hop and log line. Error bodies repeat it as
+    `request_id`.
+
+    **Errors.** Every error uses the unified contract (spec §7.4):
+    `{"error": {"code", "message", "retryable", "details"?}, "request_id"}`. A resource of
+    another workspace or session is reported as `404 not_found`, never `403`, so its existence
+    is not revealed. A malformed path ID is `400 invalid_request`.
+
+    **Authentication.**
+    - Widget: the session token from `POST /api/v1/sites/{site_key}/sessions`, sent as
+      `Authorization: Bearer <token>` (ADR-006). It is bound to one session.
+    - Admin: the `admin_session` cookie (`HttpOnly`, `Secure`, `SameSite=Lax`) set by
+      `POST /api/v1/auth/login`. Every changing admin request also sends the CSRF token from
+      the `login` (or `GET /api/v1/auth/session`) response body in `X-CSRF-Token`.
+    - CORS allows only the admin UI origin (`ADMIN_UI_ORIGIN`) with credentials. Widget calls
+      are same-origin from the `/embed` iframe and need no CORS.
+
+    **Roles** (spec FR-02): `editor` can view and upload or reindex documents; everything else
+    in a workspace needs `owner`. Each admin operation names its role.
   license:
     name: MIT
     identifier: MIT
 servers:
+  # Host port mapping for local curl examples is settled in the Compose ticket (LGW-28).
   - url: http://go-api:8090
     description: Docker Compose network
 
 tags:
   - name: health
     description: Liveness and readiness probes. No authentication.
+  - name: widget
+    description: Widget iframe document, guest sessions and chat messages (FR-01, ADR-006).
+  - name: auth
+    description: Administrator login and logout (cookie + CSRF token).
+  - name: documents
+    description: Knowledge base documents and their indexing jobs (FR-03).
+  - name: usage
+    description: Model usage and budgets of a workspace (spec §6.3, §6.4). Owner only.
+  - name: index
+    description: Embedding profile of a workspace and profile migrations (spec §8.2). Owner only.
+  - name: webhooks
+    description: Webhook subscriptions for domain events (spec §4.6). Owner only.
 
 paths:
+  # --- Health ---------------------------------------------------------------------------------
+
   /health/live:
     get:
       tags: [health]
@@ -45,7 +75,1428 @@ paths:
               example:
                 status: ok
 
+  /health/ready:
+    get:
+      tags: [health]
+      operationId: getReadiness
+      summary: Readiness probe
+      description: |
+        Returns 200 when PostgreSQL answers. Redis is optional: when it is down the Go API
+        switches to local rate limits (spec §9.3) and reports `degraded: true` with 200.
+        Downstream services (ai-service, gateway) are not checked, so one failing service
+        does not take every pod out of rotation.
+      security: []
+      responses:
+        '200':
+          description: Ready to serve traffic.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessReady'
+              examples:
+                ready:
+                  summary: All dependencies up
+                  value:
+                    status: ready
+                    degraded: false
+                    checks:
+                      postgres: ok
+                      redis: ok
+                degraded:
+                  summary: Redis down, local rate limits in use
+                  value:
+                    status: ready
+                    degraded: true
+                    checks:
+                      postgres: ok
+                      redis: fail
+        '503':
+          description: PostgreSQL is unreachable.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessNotReady'
+              example:
+                status: not_ready
+                degraded: false
+                checks:
+                  postgres: fail
+                  redis: ok
+
+  # --- Widget ---------------------------------------------------------------------------------
+
+  /embed/{site_key}:
+    parameters:
+      - $ref: '#/components/parameters/SiteKey'
+    get:
+      tags: [widget]
+      operationId: getWidgetDocument
+      summary: Widget iframe document
+      description: |
+        Small HTML document loaded by the site's loader script in an iframe (ADR-006). The
+        `Content-Security-Policy: frame-ancestors` header lists the site's `allowed_origins`,
+        so browsers refuse to show the widget on other sites. Static assets come from `web`.
+      security: []
+      responses:
+        '200':
+          description: Widget HTML document.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Content-Security-Policy:
+              required: true
+              description: Contains `frame-ancestors` built from `app.sites.allowed_origins`.
+              schema:
+                type: string
+              example: frame-ancestors https://shop.example.org
+            Cache-Control:
+              required: true
+              description: Revalidated on every load, so `allowed_origins` changes apply at once.
+              schema:
+                type: string
+                const: no-cache
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/sites/{site_key}/sessions:
+    parameters:
+      - $ref: '#/components/parameters/SiteKey'
+    post:
+      tags: [widget]
+      operationId: createSession
+      summary: Create a guest session
+      description: |
+        Creates a guest session for the site and returns its token once. The token is random
+        (at least 256 bits), lives 24 h by default and is stored only as a hash (FR-01).
+
+        Limited by IP + `site_key` (spec §9.2, 5 per minute and 30 per day by default). The
+        `site_key` is public, so limits and budgets protect the site, not key secrecy.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+            example: {}
+      responses:
+        '201':
+          description: Session created.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+              example:
+                session_id: 0193a1f0-7c2e-7a10-9b55-3f6c2d9e8a01
+                session_token: q3Jx0d8Kf2LwP1sVb7nYc4TzR9mHa6Ue5oGiN0kXjQw
+                expires_at: '2026-11-27T10:15:00Z'
+                limits:
+                  max_messages: 50
+                  max_message_length: 2000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/sessions/{session_id}/messages:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      tags: [widget]
+      operationId: listSessionMessages
+      summary: Session history
+      description: |
+        All messages of the caller's own session, oldest first. A session holds at most
+        50 questions by default (spec §9.2), so the list is not paginated.
+      security:
+        - sessionToken: []
+      responses:
+        '200':
+          description: Session messages.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageList'
+              example:
+                messages:
+                  - message_id: 0193a1f0-9d20-7a01-8b02-1c2d3e4f5a6b
+                    role: user
+                    content: What are the product return conditions?
+                    status: completed
+                    created_at: '2026-11-26T10:16:02Z'
+                    request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+                  - message_id: 0193a1f1-0a01-7d44-b2c3-7a9b8c0d1e2f
+                    role: assistant
+                    content: Returns are possible within 30 days if the store's conditions are met [S1].
+                    status: completed
+                    grounding: cited
+                    sources:
+                      - label: S1
+                        document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                        chunk_id: 0193a0aa-2222-7f66-9e55-1b2c3d4e5f60
+                        title: Return policy
+                        section: Return periods
+                        url: https://shop.example.org/returns
+                        available: true
+                    created_at: '2026-11-26T10:16:05Z'
+                    request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/WidgetUnauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [widget]
+      operationId: sendMessage
+      summary: Ask a question
+      description: |
+        Question → RAG → answer, synchronously (ADR-004). `Idempotency-Key` is required; the
+        widget retries only with the same key and the same body.
+
+        **Idempotency (spec §7.5).** Scope is the session. The Go API stores
+        `sha256(session_id || key)` and the hash of the canonical JSON body for 24 h.
+
+        | Key state | Same body | Different body |
+        | --- | --- | --- |
+        | none | user message saved, answer generated → `200` | — |
+        | `in_progress`, lock live | `409 request_in_progress` + `Retry-After` | `422 idempotency_key_reuse` |
+        | `in_progress`, lock expired | taken over: stored result, stored final error, or a new execution when there is neither a committed outcome nor a live lease | `422 idempotency_key_reuse` |
+        | `completed` | stored answer → `200`, no new model call | `422 idempotency_key_reuse` |
+        | `failed_retryable` | taken over, executed again | `422 idempotency_key_reuse` |
+        | `failed_final` | stored error with its original status | `422 idempotency_key_reuse` |
+
+        If the ai-service or gateway answers `409` because the first attempt still holds its
+        lease, the Go API returns `409 request_in_progress` with that `Retry-After` and leaves
+        the key state unchanged.
+
+        The user message is created once, together with the key. A replayed answer keeps the
+        sources of the first answer (ADR-009) and its original `request_id`.
+
+        **Timeout.** When the deadline expires (spec §4.3) the Go API stops waiting and answers
+        `504 timeout` with `details.message_id`. In the same step it sets the key to
+        `failed_retryable` and the user message to `failed` with `error.code = timeout`, so
+        `GET .../messages/{message_id}` never stays `accepted` after a `504`. A retry with the
+        same key and body takes the key over; the gateway returns its stored result if the
+        first attempt finished, so the answer is not paid twice (ADR-009).
+
+        **Limits.** Rate limits apply to every request, replays included. A replay never gets
+        `budget_exceeded` and does not count toward the session message limit.
+
+        **Length.** `message` is limited to 2000 characters (Unicode code points). A longer
+        message gets `413 message_too_long`, not `422`.
+      security:
+        - sessionToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+            example:
+              message: What are the product return conditions?
+      responses:
+        '200':
+          description: The answer, new or replayed from the idempotency record.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                # The sync POST only succeeds with an answer; `accepted` and `failed` are for
+                # the recovery GET.
+                allOf:
+                  - $ref: '#/components/schemas/MessageResult'
+                  - properties:
+                      status:
+                        const: completed
+              example:
+                message_id: 0193a1f0-9d20-7a01-8b02-1c2d3e4f5a6b
+                status: completed
+                answer: Returns are possible within 30 days if the store's conditions are met [S1].
+                grounding: cited
+                sources:
+                  - label: S1
+                    document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                    chunk_id: 0193a0aa-2222-7f66-9e55-1b2c3d4e5f60
+                    title: Return policy
+                    section: Return periods
+                    url: https://shop.example.org/returns
+                    available: true
+                model:
+                  provider: openai
+                  name: configured-chat-model
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+                created_at: '2026-11-26T10:16:02Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/WidgetUnauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/RequestInProgress'
+        '413':
+          $ref: '#/components/responses/MessageTooLong'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/ProviderError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/MessageTimeout'
+
+  /api/v1/sessions/{session_id}/messages/{message_id}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+      - name: message_id
+        in: path
+        required: true
+        description: ID of the user message, as returned by `POST .../messages` or a `504` body.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [widget]
+      operationId: getMessageResult
+      summary: Message status and result
+      description: |
+        Outcome of one question, for recovery after a client timeout (ADR-004).
+        - `accepted`: a request for this question is running right now (for example a retry
+          from another tab). Wait `Retry-After` seconds and ask again.
+        - `failed` with `error.retryable: true` (for example `timeout` after a `504`): retry
+          `POST .../messages` with the same `Idempotency-Key` and body.
+        - `failed` with `error.retryable: false`: final; a retry returns the same error.
+      security:
+        - sessionToken: []
+      responses:
+        '200':
+          description: Current state of the question.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            Retry-After:
+              description: Sent only with `status = accepted`.
+              schema:
+                type: integer
+                minimum: 0
+              example: 5
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResult'
+              examples:
+                accepted:
+                  summary: Still processing
+                  value:
+                    message_id: 0193a1f0-9d20-7a01-8b02-1c2d3e4f5a6b
+                    status: accepted
+                    request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+                    created_at: '2026-11-26T10:16:02Z'
+                failed:
+                  summary: Failed for good
+                  value:
+                    message_id: 0193a1f0-9d20-7a01-8b02-1c2d3e4f5a6b
+                    status: failed
+                    error:
+                      code: provider_error
+                      message: The model provider returned an error
+                      retryable: false
+                    request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+                    created_at: '2026-11-26T10:16:02Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/WidgetUnauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # --- Auth -----------------------------------------------------------------------------------
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Administrator login
+      description: |
+        Sets the `admin_session` cookie (8 h by default) and returns the CSRF token for
+        `X-CSRF-Token`. Wrong email and wrong password give the same `401`. Rate limited by
+        IP and email. A request with an `Origin` other than the Go API or `ADMIN_UI_ORIGIN`
+        gets `403 origin_not_allowed` (login CSRF).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: admin@example.org
+              password: <ADMIN_PASSWORD>
+      responses:
+        '200':
+          description: Logged in.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            Set-Cookie:
+              required: true
+              description: The admin session cookie.
+              schema:
+                type: string
+              example: admin_session=Zm9vYmFy...; Path=/; Max-Age=28800; HttpOnly; Secure; SameSite=Lax
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminSession'
+              example:
+                csrf_token: Hk2pV9xQ4mT7wZ1cN8bR3sL6yD0fJ5gA2eU9iO4kWqE
+                expires_at: '2026-11-26T18:15:00Z'
+                user:
+                  user_id: 0193a000-1a2b-7c3d-8e4f-5a6b7c8d9e0f
+                  email: admin@example.org
+                workspaces:
+                  - workspace_id: 0193a000-2b3c-7d4e-9f50-6b7c8d9e0f1a
+                    name: Example shop
+                    role: owner
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/auth/session:
+    get:
+      tags: [auth]
+      operationId: getAdminSession
+      summary: Current admin session
+      description: |
+        Returns the current admin session with its CSRF token (the same one `login`
+        returned) and the user's workspaces, so a reloaded admin UI can continue without a
+        new login. Read-only: the token is not rotated, so other open tabs keep working and a
+        cross-site navigation cannot invalidate it. CORS lets only `ADMIN_UI_ORIGIN` read
+        the body. Not in spec §7.1 yet (LGW-26).
+      security:
+        - adminSession: []
+      responses:
+        '200':
+          description: The current session.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminSession'
+              example:
+                csrf_token: Hk2pV9xQ4mT7wZ1cN8bR3sL6yD0fJ5gA2eU9iO4kWqE
+                expires_at: '2026-11-26T18:15:00Z'
+                user:
+                  user_id: 0193a000-1a2b-7c3d-8e4f-5a6b7c8d9e0f
+                  email: admin@example.org
+                workspaces:
+                  - workspace_id: 0193a000-2b3c-7d4e-9f50-6b7c8d9e0f1a
+                    name: Example shop
+                    role: owner
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: End the admin session
+      description: Deletes the admin session and clears the cookie.
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '204':
+          description: Logged out.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+            Set-Cookie:
+              required: true
+              description: Expires the admin session cookie.
+              schema:
+                type: string
+              example: admin_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # --- Documents ------------------------------------------------------------------------------
+
+  /api/v1/workspaces/{workspace_id}/documents:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [documents]
+      operationId: listDocuments
+      summary: List documents
+      description: Non-deleted documents of the workspace, newest first. Role `editor` or `owner`.
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of documents.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentList'
+              example:
+                documents:
+                  - document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                    title: Return policy
+                    active_version_id: 0193a0aa-3333-7a77-8f66-2c3d4e5f6a71
+                    latest_version:
+                      version_id: 0193a0aa-3333-7a77-8f66-2c3d4e5f6a71
+                      version: 1
+                      state: indexed
+                      content_type: text/markdown
+                      size_bytes: 5120
+                      content_hash: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+                      created_at: '2026-11-25T09:00:00Z'
+                    created_at: '2026-11-25T09:00:00Z'
+                next_cursor: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [documents]
+      operationId: uploadDocument
+      summary: Upload a document
+      description: |
+        Uploads a new document, or a new version when `document_id` is set. Role `editor` or
+        `owner`. The Go API checks size (10 MB by default), the format signature, a safe file
+        name, the workspace storage limit (200 MB) and active jobs (3).
+
+        **Order.** The Go API first writes the file to a temporary file on disk (memory stays
+        bounded) and hashes it while writing. Then it checks and claims the idempotency key,
+        and only after that streams the staged file to the ai-service (spec §4.5). So `409`
+        and `422 idempotency_key_reuse` never leave a version or job behind.
+
+        The same content as a non-deleted document of the workspace creates nothing new: the
+        response returns the existing IDs with `deduplicated: true`.
+
+        `Idempotency-Key` is optional; its scope is the workspace (spec §7.5). The request
+        hash is `sha256` of the canonical JSON `{"file_sha256", "title", "document_id"}`, where
+        `title` is the effective title (the file name when none was sent) and a missing
+        `document_id` is `null`.
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UploadDocumentRequest'
+            encoding:
+              file:
+                # The type is detected from the file signature (spec §4.5), so the part's own
+                # Content-Type is ignored: curl -F sends .md files as application/octet-stream.
+                contentType: '*/*'
+      responses:
+        '202':
+          description: Accepted; indexing runs in the background.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestionAccepted'
+              example:
+                document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                version_id: 0193a0aa-3333-7a77-8f66-2c3d4e5f6a71
+                job_id: 0193a0aa-4444-7b88-9a77-3d4e5f6a7b82
+                deduplicated: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/RequestInProgress'
+        '413':
+          $ref: '#/components/responses/FileTooLarge'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/workspaces/{workspace_id}/documents/{document_id}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [documents]
+      operationId: getDocument
+      summary: Document with versions
+      description: The document, all its versions and the active one. Role `editor` or `owner`.
+      security:
+        - adminSession: []
+      responses:
+        '200':
+          description: The document.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+              example:
+                document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                title: Return policy
+                active_version_id: 0193a0aa-3333-7a77-8f66-2c3d4e5f6a71
+                versions:
+                  - version_id: 0193a0ab-5555-7c99-8b88-4e5f6a7b8c93
+                    version: 2
+                    state: indexing
+                    content_type: text/markdown
+                    size_bytes: 5300
+                    content_hash: 60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752
+                    created_at: '2026-11-26T08:00:00Z'
+                  - version_id: 0193a0aa-3333-7a77-8f66-2c3d4e5f6a71
+                    version: 1
+                    state: indexed
+                    content_type: text/markdown
+                    size_bytes: 5120
+                    content_hash: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+                    created_at: '2026-11-25T09:00:00Z'
+                created_at: '2026-11-25T09:00:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      tags: [documents]
+      operationId: deleteDocument
+      summary: Delete a document
+      description: |
+        Soft-deletes the document: it leaves search at once and stays in old answers as
+        "source deleted" (FR-04). Role `owner`. Written to the audit log.
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '204':
+          description: Deleted.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/workspaces/{workspace_id}/documents/{document_id}/reindex:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - $ref: '#/components/parameters/DocumentId'
+    post:
+      tags: [documents]
+      operationId: reindexDocument
+      summary: Reindex a document
+      description: |
+        Queues a reindex of the latest version. Role `editor` or `owner`. If a job for the
+        document is already queued or running, returns it with `deduplicated: true`. A
+        document with no stored version gets `409 conflict`.
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '202':
+          description: Reindex queued.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestionAccepted'
+              example:
+                document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                version_id: 0193a0aa-3333-7a77-8f66-2c3d4e5f6a71
+                job_id: 0193a0ac-6666-7daa-9c99-5f6a7b8c9da4
+                deduplicated: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/workspaces/{workspace_id}/ingestion-jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [documents]
+      operationId: getIngestionJob
+      summary: Indexing job status
+      description: Status, attempts and a safe error description (FR-03). Role `editor` or `owner`.
+      security:
+        - adminSession: []
+      responses:
+        '200':
+          description: The job.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestionJob'
+              example:
+                job_id: 0193a0aa-4444-7b88-9a77-3d4e5f6a7b82
+                document_id: 0193a0aa-1111-7e55-8d44-0a1b2c3d4e5f
+                version_id: 0193a0aa-3333-7a77-8f66-2c3d4e5f6a71
+                kind: ingest
+                status: retry_wait
+                attempts: 2
+                max_attempts: 5
+                error:
+                  code: provider_unavailable
+                  message: The embedding provider is temporarily unavailable
+                created_at: '2026-11-25T09:00:00Z'
+                finished_at: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # --- Usage and budgets ----------------------------------------------------------------------
+
+  /api/v1/workspaces/{workspace_id}/usage:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [usage]
+      operationId: getWorkspaceUsage
+      summary: Model usage
+      description: |
+        Model usage of the workspace grouped by operation, provider and model (spec §6.3).
+        Every attempt counts, including retries. `estimated_cost_usd` covers only priced
+        calls; `unpriced_calls` counts the rest. Dates are UTC and inclusive; the range is
+        at most 366 days. Role `owner`.
+      security:
+        - adminSession: []
+      parameters:
+        - name: from
+          in: query
+          description: First day (UTC). Default is the first day of the current month.
+          schema:
+            type: string
+            format: date
+          example: '2026-11-01'
+        - name: to
+          in: query
+          description: Last day (UTC), inclusive. Default is today.
+          schema:
+            type: string
+            format: date
+          example: '2026-11-26'
+      responses:
+        '200':
+          description: Usage for the range.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceUsage'
+              example:
+                from: '2026-11-01'
+                to: '2026-11-26'
+                totals:
+                  calls: 412
+                  input_tokens: 1530200
+                  output_tokens: 98110
+                  cache_write_tokens: 0
+                  cache_read_tokens: 0
+                  estimated_cost_usd: '4.1900'
+                  unpriced_calls: 0
+                items:
+                  - operation: generate
+                    provider: openai
+                    model: configured-chat-model
+                    calls: 206
+                    input_tokens: 1210000
+                    output_tokens: 98110
+                    cache_write_tokens: 0
+                    cache_read_tokens: 0
+                    estimated_cost_usd: '4.1900'
+                    unpriced_calls: 0
+                  - operation: embed_query
+                    provider: ollama
+                    model: configured-embedding-model
+                    calls: 206
+                    input_tokens: 320200
+                    output_tokens: 0
+                    cache_write_tokens: 0
+                    cache_read_tokens: 0
+                    # Local models have an API price of 0 (spec §6.3).
+                    estimated_cost_usd: '0'
+                    unpriced_calls: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/workspaces/{workspace_id}/budgets:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [usage]
+      operationId: getBudgets
+      summary: Budgets and current spending
+      description: |
+        Limits, spending and active reservations for the current periods (spec §6.4):
+        workspace chat (month), indexing (month) and each site (day). Role `owner`.
+      security:
+        - adminSession: []
+      responses:
+        '200':
+          description: Budgets of the workspace.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetOverview'
+              example:
+                workspace:
+                  period: month
+                  period_start: '2026-11-01'
+                  limit_usd: '50.00'
+                  limit_tokens: null
+                  spent_usd: '4.2120'
+                  reserved_usd: '0.0310'
+                  spent_tokens: 1628310
+                  reserved_tokens: 4000
+                indexing:
+                  period: month
+                  period_start: '2026-11-01'
+                  limit_usd: '10.00'
+                  limit_tokens: null
+                  spent_usd: '0.1500'
+                  reserved_usd: '0'
+                  spent_tokens: 750000
+                  reserved_tokens: 0
+                sites:
+                  - site_id: 0193a000-3c4d-7e5f-8a61-7c8d9e0f1a2b
+                    site_key: example-site
+                    budget:
+                      period: day
+                      period_start: '2026-11-26'
+                      limit_usd: '5.00'
+                      limit_tokens: null
+                      spent_usd: '0.3100'
+                      reserved_usd: '0.0310'
+                      spent_tokens: 120400
+                      reserved_tokens: 4000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    put:
+      tags: [usage]
+      operationId: updateBudgets
+      summary: Change workspace and site budgets
+      description: |
+        Sets limits for the given scopes; scopes left out keep their limits. A `null` limit
+        means no limit of that kind, but each scope needs at least one non-null limit
+        (spec §6.4), otherwise `422 validation_failed`. A `site_id` outside this workspace
+        gets `404 not_found`; the same `site_id` twice gets `422 validation_failed`. A new limit applies to the current period at once, and
+        a limit below the current spending blocks new paid calls. Role `owner`. Written to
+        the audit log.
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BudgetUpdate'
+            example:
+              workspace:
+                limit_usd: '50.00'
+                limit_tokens: null
+              sites:
+                - site_id: 0193a000-3c4d-7e5f-8a61-7c8d9e0f1a2b
+                  limits:
+                    limit_usd: '5.00'
+                    limit_tokens: null
+      responses:
+        '200':
+          description: Budgets after the change.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetOverview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # --- Index ----------------------------------------------------------------------------------
+
+  /api/v1/workspaces/{workspace_id}/index:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [index]
+      operationId: getIndexState
+      summary: Embedding profiles and migration progress
+      description: Active and target embedding profile and migration progress. Role `owner`.
+      security:
+        - adminSession: []
+      responses:
+        '200':
+          description: Index state.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexState'
+              example:
+                active_profile:
+                  profile_id: 1
+                  provider: ollama
+                  model: configured-embedding-model
+                  dimensions: 768
+                  version: 1
+                target_profile: null
+                migration: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/workspaces/{workspace_id}/index/migrations:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [index]
+      operationId: startIndexMigration
+      summary: Switch to a new embedding profile
+      description: |
+        Sets the target profile and queues `embed_profile` jobs for every active version
+        (spec §8.2). Search keeps the active profile until all versions are embedded in the
+        target one. A running migration or a target equal to the active profile gets
+        `409 conflict`; an unknown profile gets `422 validation_failed`. Role `owner`.
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartIndexMigrationRequest'
+            example:
+              target_profile_id: 2
+      responses:
+        '202':
+          description: Migration started.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexState'
+              example:
+                active_profile:
+                  profile_id: 1
+                  provider: ollama
+                  model: configured-embedding-model
+                  dimensions: 768
+                  version: 1
+                target_profile:
+                  profile_id: 2
+                  provider: openai
+                  model: configured-embedding-model-large
+                  dimensions: 1536
+                  version: 1
+                migration:
+                  started_at: '2026-11-26T11:00:00Z'
+                  versions_total: 42
+                  versions_done: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # --- Webhooks -------------------------------------------------------------------------------
+
+  /api/v1/workspaces/{workspace_id}/webhooks:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [webhooks]
+      operationId: listWebhooks
+      summary: Subscriptions and delivery statistics
+      description: All subscriptions of the workspace, including disabled ones. Role `owner`.
+      security:
+        - adminSession: []
+      responses:
+        '200':
+          description: Subscriptions.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookList'
+              example:
+                webhooks:
+                  - webhook_id: 0193a0ad-7777-7ebb-8daa-6a7b8c9d0eb5
+                    url: https://hooks.example.org/llm-gateway
+                    event_types: [kb.document.indexed, kb.document.failed]
+                    created_at: '2026-11-20T12:00:00Z'
+                    disabled_at: null
+                    deliveries:
+                      pending: 0
+                      delivered: 17
+                      dead: 1
+                      last_delivery_at: '2026-11-26T09:01:12Z'
+                      last_http_status: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [webhooks]
+      operationId: createWebhook
+      summary: Create a subscription
+      description: |
+        Creates a subscription. The signing secret (HMAC-SHA256, spec §4.6) is returned only
+        in this response. The URL must be `https` and must not resolve to a private,
+        loopback or link-local address (`422 validation_failed`). URLs with credentials
+        (`user:pass@`) are rejected. Role `owner`.
+
+        Delivery rules (spec §9.1): the host is resolved and checked again before every
+        delivery (DNS rebinding), and the connection goes to the validated IP itself, never
+        to a second lookup; TLS still verifies the original hostname. Redirects are not
+        followed, and each delivery has a 10 s
+        timeout and a response size limit.
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+            example:
+              url: https://hooks.example.org/llm-gateway
+              event_types: [kb.document.indexed, kb.document.failed]
+      responses:
+        '201':
+          description: Subscription created.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookCreated'
+              example:
+                webhook:
+                  webhook_id: 0193a0ad-7777-7ebb-8daa-6a7b8c9d0eb5
+                  url: https://hooks.example.org/llm-gateway
+                  event_types: [kb.document.indexed, kb.document.failed]
+                  created_at: '2026-11-26T12:00:00Z'
+                  disabled_at: null
+                  deliveries:
+                    pending: 0
+                    delivered: 0
+                    dead: 0
+                    last_delivery_at: null
+                    last_http_status: null
+                secret: whsec_Nq4Lr8Xt2Vb6Zm1Pc9Ks3Hd7Gf5Jw0Ya4Ue8Io2Tq6Rz
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/workspaces/{workspace_id}/webhooks/{webhook_id}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - name: webhook_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      tags: [webhooks]
+      operationId: disableWebhook
+      summary: Disable a subscription
+      description: |
+        Disables the subscription; pending deliveries are dropped and statistics are kept.
+        Disabling an already disabled subscription also returns `204`. Role `owner`.
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '204':
+          description: Disabled.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
 components:
+  securitySchemes:
+    sessionToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Guest session token from `createSession` (ADR-006). Bound to one session.
+    adminSession:
+      type: apiKey
+      in: cookie
+      name: admin_session
+      description: Admin session cookie set by `login`. `HttpOnly`, `Secure`, `SameSite=Lax`.
+
+  parameters:
+    SiteKey:
+      name: site_key
+      in: path
+      required: true
+      description: Public key of a connected site (`app.sites.site_key`).
+      schema:
+        type: string
+        pattern: '^[a-z0-9][a-z0-9-]{2,62}$'
+      example: example-site
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    WorkspaceId:
+      name: workspace_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DocumentId:
+      name: document_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CsrfToken:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      description: |
+        CSRF token from the `login` or `getAdminSession` response body. Checked by middleware
+        before request validation, so a missing or wrong token gets `403 csrf_failed`, never
+        `400`.
+      schema:
+        type: string
+        minLength: 1
+    IdempotencyKeyRequired:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID, reused for every retry of the same request (spec §7.5).
+      schema:
+        $ref: '#/components/schemas/IdempotencyKey'
+      example: 0193a1f0-9d11-7b42-8c01-5e7f3a2b1c99
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Client-generated UUID, reused for every retry of the same request (spec §7.5).
+      schema:
+        $ref: '#/components/schemas/IdempotencyKey'
+      example: 0193a1f0-9d11-7b42-8c01-5e7f3a2b1c99
+    Limit:
+      name: limit
+      in: query
+      description: Page size.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque `next_cursor` from the previous page.
+      schema:
+        type: string
+        minLength: 1
+
   headers:
     XRequestId:
       required: true
@@ -53,6 +1504,20 @@ components:
       schema:
         $ref: '#/components/schemas/RequestId'
       example: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+    CacheControlNoStore:
+      required: true
+      description: |
+        Private, per-user response (some carry secrets). Shared caches ignore cookie
+        auth, so no cache may store it (RFC 9111).
+      schema:
+        type: string
+        const: no-store
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        minimum: 0
+      example: 30
 
   schemas:
     RequestId:
@@ -60,6 +1525,25 @@ components:
       format: uuid
       description: UUIDv7 created by the Go API (spec 4.2).
       pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+
+    IdempotencyKey:
+      type: string
+      format: uuid
+      description: |
+        Lowercased before hashing, so the same UUID in another letter case is the same key
+        and a retry is never paid twice.
+      pattern: '^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$'
+
+    Usd:
+      type: string
+      description: Amount in USD as a decimal string, to avoid float rounding.
+      pattern: '^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$'
+
+    Timestamp:
+      type: string
+      format: date-time
+
+    # --- Health -------------------------------------------------------------------------------
 
     LivenessStatus:
       type: object
@@ -69,3 +1553,1437 @@ components:
         status:
           type: string
           const: ok
+
+    ReadinessReady:
+      type: object
+      additionalProperties: false
+      required: [status, degraded, checks]
+      properties:
+        status:
+          type: string
+          const: ready
+        degraded:
+          type: boolean
+          description: '`true` when Redis is down and local rate limits are used (spec 9.3).'
+        checks:
+          $ref: '#/components/schemas/ReadinessChecks'
+
+    ReadinessNotReady:
+      type: object
+      additionalProperties: false
+      required: [status, degraded, checks]
+      properties:
+        status:
+          type: string
+          const: not_ready
+        degraded:
+          type: boolean
+          description: '`true` when Redis is down and local rate limits are used (spec 9.3).'
+        checks:
+          $ref: '#/components/schemas/ReadinessChecks'
+
+    ReadinessChecks:
+      type: object
+      description: Result of each dependency check. `postgres` is required, `redis` is optional.
+      additionalProperties: false
+      required: [postgres, redis]
+      properties:
+        postgres:
+          $ref: '#/components/schemas/CheckResult'
+        redis:
+          $ref: '#/components/schemas/CheckResult'
+
+    CheckResult:
+      type: string
+      enum: [ok, fail]
+
+    # --- Widget -------------------------------------------------------------------------------
+
+    CreateSessionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        human_check_token:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: |
+            Token of the optional human check (spec §9.2). Required only when the check is
+            enabled; a missing or rejected token gets `403 forbidden`.
+
+    Session:
+      type: object
+      additionalProperties: false
+      required: [session_id, session_token, expires_at, limits]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        session_token:
+          type: string
+          description: |
+            Random token (at least 256 bits, base64url). Returned only here. The widget keeps
+            it in memory and iframe storage, never in a cookie or on the host page.
+          pattern: '^[A-Za-z0-9_-]{43,128}$'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        limits:
+          $ref: '#/components/schemas/SessionLimits'
+
+    SessionLimits:
+      type: object
+      additionalProperties: false
+      required: [max_messages, max_message_length]
+      properties:
+        max_messages:
+          type: integer
+          minimum: 1
+          description: Questions allowed in this session (spec 9.2).
+        max_message_length:
+          type: integer
+          minimum: 1
+          description: Maximum `message` length in characters.
+
+    SendMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [message]
+      properties:
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: The question. Over 2000 characters → `413 message_too_long`.
+
+    MessageStatus:
+      type: string
+      enum: [accepted, completed, failed]
+      description: |
+        `accepted`: saved, the answer is being generated. `completed`: answered.
+        `failed`: no answer; `error` says why.
+
+    Grounding:
+      type: string
+      enum: [cited, uncited, no_answer]
+      description: |
+        `cited`: valid citations present. `uncited`: no valid citations, the UI marks the
+        answer as unsupported. `no_answer`: the documents had no answer (FR-04).
+
+    MessageResult:
+      type: object
+      additionalProperties: false
+      required: [message_id, status, request_id, created_at]
+      description: |
+        Outcome of one question. `answer`, `grounding`, `sources` and `model` are present
+        when `status = completed`; `error` when `status = failed`.
+      # if/then instead of oneOf + discriminator: code generators keep one flat type, while
+      # validators and contract tests still enforce the per-status fields.
+      allOf:
+        - if:
+            properties:
+              status:
+                const: completed
+          then:
+            required: [answer, grounding, sources, model]
+        - if:
+            properties:
+              status:
+                const: failed
+          then:
+            required: [error]
+      properties:
+        message_id:
+          type: string
+          format: uuid
+          description: ID of the user message. Also the key for `getMessageResult`.
+        status:
+          $ref: '#/components/schemas/MessageStatus'
+        answer:
+          type: string
+          description: Answer text with only valid `[Sn]` labels kept.
+        grounding:
+          $ref: '#/components/schemas/Grounding'
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/Source'
+        model:
+          $ref: '#/components/schemas/ModelInfo'
+        error:
+          $ref: '#/components/schemas/Error'
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+          description: Request that produced the answer. A replay keeps the original ID.
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    MessageList:
+      type: object
+      additionalProperties: false
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/HistoryMessage'
+
+    HistoryMessage:
+      type: object
+      additionalProperties: false
+      required: [message_id, role, content, status, created_at, request_id]
+      description: |
+        One message of the history. A user message carries the status of its question;
+        an assistant message also has `grounding` and `sources`.
+      allOf:
+        - if:
+            properties:
+              role:
+                const: assistant
+          then:
+            required: [grounding, sources]
+        - if:
+            properties:
+              status:
+                const: failed
+          then:
+            required: [error]
+      properties:
+        message_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          type: string
+        status:
+          $ref: '#/components/schemas/MessageStatus'
+        grounding:
+          $ref: '#/components/schemas/Grounding'
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/Source'
+        error:
+          $ref: '#/components/schemas/Error'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+
+    Source:
+      type: object
+      additionalProperties: false
+      required: [label, document_id, chunk_id, title, available]
+      description: |
+        Snapshot of a cited source taken when the answer was generated (FR-04). The server
+        builds `url` from document metadata; model-written URLs never become links. Access
+        is checked again on every response, replays included (ADR-009): a source that is no
+        longer available has `available: false` and no `url`.
+      if:
+        properties:
+          available:
+            const: false
+      then:
+        properties:
+          url:
+            type: 'null'
+      properties:
+        label:
+          type: string
+          pattern: '^S[1-9][0-9]*$'
+        document_id:
+          type: string
+          format: uuid
+        chunk_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        section:
+          type: [string, 'null']
+        url:
+          type: [string, 'null']
+          format: uri
+        available:
+          type: boolean
+          description: '`false` when the document was deleted; the UI shows "source deleted".'
+
+    ModelInfo:
+      type: object
+      additionalProperties: false
+      required: [provider, name]
+      properties:
+        provider:
+          type: string
+        name:
+          type: string
+
+    # --- Auth ---------------------------------------------------------------------------------
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1024
+
+    AdminSession:
+      type: object
+      additionalProperties: false
+      required: [csrf_token, expires_at, user, workspaces]
+      properties:
+        csrf_token:
+          type: string
+          description: Send in `X-CSRF-Token` on every changing admin request.
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        user:
+          $ref: '#/components/schemas/AdminUser'
+        workspaces:
+          type: array
+          description: Workspaces the user is a member of, with the role in each.
+          items:
+            $ref: '#/components/schemas/WorkspaceMembership'
+
+    AdminUser:
+      type: object
+      additionalProperties: false
+      required: [user_id, email]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+
+    WorkspaceMembership:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, name, role]
+      properties:
+        workspace_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        role:
+          type: string
+          enum: [owner, editor]
+
+    # --- Documents ----------------------------------------------------------------------------
+
+    UploadDocumentRequest:
+      type: object
+      additionalProperties: false
+      required: [file]
+      properties:
+        file:
+          type: string
+          contentMediaType: application/octet-stream
+          description: Plain text, Markdown or PDF with a text layer. Checked by signature.
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Defaults to the file name.
+        document_id:
+          type: string
+          format: uuid
+          description: Set to upload a new version of this document.
+
+    IngestionAccepted:
+      type: object
+      additionalProperties: false
+      required: [document_id, version_id, job_id, deduplicated]
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        version_id:
+          type: string
+          format: uuid
+        job_id:
+          type: string
+          format: uuid
+        deduplicated:
+          type: boolean
+          description: '`true` when existing IDs were returned and nothing new was created.'
+
+    DocumentList:
+      type: object
+      additionalProperties: false
+      required: [documents, next_cursor]
+      properties:
+        documents:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentSummary'
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor of the next page, `null` on the last page.
+
+    DocumentSummary:
+      type: object
+      additionalProperties: false
+      required: [document_id, title, active_version_id, latest_version, created_at]
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        active_version_id:
+          type: [string, 'null']
+          format: uuid
+          description: Version used by search; `null` until the first version is indexed.
+        latest_version:
+          $ref: '#/components/schemas/DocumentVersion'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    Document:
+      type: object
+      additionalProperties: false
+      required: [document_id, title, active_version_id, versions, created_at]
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        active_version_id:
+          type: [string, 'null']
+          format: uuid
+          description: Version used by search; `null` until the first version is indexed.
+        versions:
+          type: array
+          description: All versions, newest first.
+          items:
+            $ref: '#/components/schemas/DocumentVersion'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    DocumentVersion:
+      type: object
+      additionalProperties: false
+      required: [version_id, version, state, content_type, size_bytes, content_hash, created_at]
+      properties:
+        version_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          minimum: 1
+        state:
+          type: string
+          enum: [pending, indexing, indexed, superseded, failed]
+        content_type:
+          type: string
+          enum: [text/plain, text/markdown, application/pdf]
+        size_bytes:
+          type: integer
+          minimum: 0
+        content_hash:
+          type: string
+          description: SHA-256 of the file, hex.
+          pattern: '^[0-9a-f]{64}$'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    IngestionJob:
+      type: object
+      additionalProperties: false
+      required:
+        - job_id
+        - document_id
+        - version_id
+        - kind
+        - status
+        - attempts
+        - max_attempts
+        - error
+        - created_at
+        - finished_at
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        version_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [ingest, reindex, embed_profile]
+        status:
+          type: string
+          enum: [queued, processing, retry_wait, completed, failed, dead]
+          description: |
+            `retry_wait`: a retryable error, the next attempt is scheduled. `failed`: a final
+            error such as a corrupted file or an exhausted indexing budget. `dead`: attempts
+            ran out (spec 8.3).
+        attempts:
+          type: integer
+          minimum: 0
+        max_attempts:
+          type: integer
+          minimum: 1
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/JobError'
+            - type: 'null'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+
+    JobError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      description: Last error of the job. Safe to show; no file content or internal paths.
+      properties:
+        code:
+          type: string
+          examples: [budget_exceeded, unsupported_file_type, provider_unavailable]
+        message:
+          type: string
+
+    # --- Usage and budgets --------------------------------------------------------------------
+
+    WorkspaceUsage:
+      type: object
+      additionalProperties: false
+      required: [from, to, totals, items]
+      properties:
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+        totals:
+          $ref: '#/components/schemas/UsageTotals'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageItem'
+
+    UsageTotals:
+      type: object
+      additionalProperties: false
+      required:
+        - calls
+        - input_tokens
+        - output_tokens
+        - cache_write_tokens
+        - cache_read_tokens
+        - estimated_cost_usd
+        - unpriced_calls
+      properties:
+        calls:
+          type: integer
+          minimum: 0
+          description: Provider call attempts, retries included.
+        input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        cache_write_tokens:
+          type: integer
+          minimum: 0
+        cache_read_tokens:
+          type: integer
+          minimum: 0
+        estimated_cost_usd:
+          $ref: '#/components/schemas/Usd'
+        unpriced_calls:
+          type: integer
+          minimum: 0
+          description: Attempts with an unknown model price, left out of `estimated_cost_usd`.
+
+    UsageItem:
+      type: object
+      additionalProperties: false
+      required:
+        - operation
+        - provider
+        - model
+        - calls
+        - input_tokens
+        - output_tokens
+        - cache_write_tokens
+        - cache_read_tokens
+        - estimated_cost_usd
+        - unpriced_calls
+      properties:
+        operation:
+          type: string
+          enum: [condense, generate, embed_query, embed_document, chat_completion]
+          description: |
+            `chat_completion`: external `/v1/chat/completions` calls made with an application
+            API key of this workspace (ADR-013). The others are RAG operations (spec §6.3).
+        provider:
+          type: string
+        model:
+          type: string
+        calls:
+          type: integer
+          minimum: 0
+        input_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        cache_write_tokens:
+          type: integer
+          minimum: 0
+        cache_read_tokens:
+          type: integer
+          minimum: 0
+        estimated_cost_usd:
+          $ref: '#/components/schemas/Usd'
+        unpriced_calls:
+          type: integer
+          minimum: 0
+
+    BudgetOverview:
+      type: object
+      additionalProperties: false
+      required: [workspace, indexing, sites]
+      properties:
+        workspace:
+          $ref: '#/components/schemas/BudgetPeriod'
+        indexing:
+          $ref: '#/components/schemas/BudgetPeriod'
+        sites:
+          type: array
+          items:
+            $ref: '#/components/schemas/SiteBudget'
+
+    BudgetPeriod:
+      type: object
+      additionalProperties: false
+      required:
+        - period
+        - period_start
+        - limit_usd
+        - limit_tokens
+        - spent_usd
+        - reserved_usd
+        - spent_tokens
+        - reserved_tokens
+      description: Current period of one budget. Calendar periods in UTC.
+      properties:
+        period:
+          type: string
+          enum: [day, month]
+        period_start:
+          type: string
+          format: date
+        limit_usd:
+          oneOf:
+            - $ref: '#/components/schemas/Usd'
+            - type: 'null'
+        limit_tokens:
+          type: [integer, 'null']
+          minimum: 0
+        spent_usd:
+          $ref: '#/components/schemas/Usd'
+        reserved_usd:
+          $ref: '#/components/schemas/Usd'
+        spent_tokens:
+          type: integer
+          minimum: 0
+        reserved_tokens:
+          type: integer
+          minimum: 0
+
+    SiteBudget:
+      type: object
+      additionalProperties: false
+      required: [site_id, site_key, budget]
+      properties:
+        site_id:
+          type: string
+          format: uuid
+        site_key:
+          type: string
+        budget:
+          $ref: '#/components/schemas/BudgetPeriod'
+
+    BudgetUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        workspace:
+          $ref: '#/components/schemas/BudgetLimits'
+        indexing:
+          $ref: '#/components/schemas/BudgetLimits'
+        sites:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SiteBudgetLimits'
+
+    BudgetLimits:
+      type: object
+      additionalProperties: false
+      required: [limit_usd, limit_tokens]
+      description: |
+        Both fields are required; `null` means no limit of that kind. At least one must be
+        non-null (spec §6.4): a budget with no limit at all is rejected.
+      anyOf:
+        - properties:
+            limit_usd:
+              $ref: '#/components/schemas/Usd'
+        - properties:
+            limit_tokens:
+              type: integer
+      properties:
+        limit_usd:
+          oneOf:
+            - $ref: '#/components/schemas/Usd'
+            - type: 'null'
+        limit_tokens:
+          type: [integer, 'null']
+          minimum: 0
+
+    SiteBudgetLimits:
+      type: object
+      additionalProperties: false
+      required: [site_id, limits]
+      properties:
+        site_id:
+          type: string
+          format: uuid
+        limits:
+          $ref: '#/components/schemas/BudgetLimits'
+
+    # --- Index --------------------------------------------------------------------------------
+
+    IndexState:
+      type: object
+      additionalProperties: false
+      required: [active_profile, target_profile, migration]
+      properties:
+        active_profile:
+          $ref: '#/components/schemas/EmbeddingProfile'
+        target_profile:
+          oneOf:
+            - $ref: '#/components/schemas/EmbeddingProfile'
+            - type: 'null'
+        migration:
+          oneOf:
+            - $ref: '#/components/schemas/IndexMigration'
+            - type: 'null'
+
+    EmbeddingProfile:
+      type: object
+      additionalProperties: false
+      required: [profile_id, provider, model, dimensions, version]
+      properties:
+        profile_id:
+          type: integer
+          minimum: 1
+        provider:
+          type: string
+        model:
+          type: string
+        dimensions:
+          type: integer
+          minimum: 1
+        version:
+          type: integer
+          minimum: 1
+
+    IndexMigration:
+      type: object
+      additionalProperties: false
+      required: [started_at, versions_total, versions_done]
+      properties:
+        started_at:
+          $ref: '#/components/schemas/Timestamp'
+        versions_total:
+          type: integer
+          minimum: 0
+          description: Active document versions to embed in the target profile.
+        versions_done:
+          type: integer
+          minimum: 0
+
+    StartIndexMigrationRequest:
+      type: object
+      additionalProperties: false
+      required: [target_profile_id]
+      properties:
+        target_profile_id:
+          type: integer
+          minimum: 1
+
+    # --- Webhooks -----------------------------------------------------------------------------
+
+    EventType:
+      type: string
+      enum:
+        - chat.message.completed
+        - kb.document.indexed
+        - kb.document.failed
+        - llm.usage.recorded
+
+    WebhookList:
+      type: object
+      additionalProperties: false
+      required: [webhooks]
+      properties:
+        webhooks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Webhook'
+
+    Webhook:
+      type: object
+      additionalProperties: false
+      required: [webhook_id, url, event_types, created_at, disabled_at, deliveries]
+      properties:
+        webhook_id:
+          type: string
+          format: uuid
+        url:
+          type: string
+          format: uri
+        event_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventType'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        disabled_at:
+          type: [string, 'null']
+          format: date-time
+        deliveries:
+          $ref: '#/components/schemas/DeliveryStats'
+
+    DeliveryStats:
+      type: object
+      additionalProperties: false
+      required: [pending, delivered, dead, last_delivery_at, last_http_status]
+      properties:
+        pending:
+          type: integer
+          minimum: 0
+          description: Waiting for the first attempt or a retry.
+        delivered:
+          type: integer
+          minimum: 0
+        dead:
+          type: integer
+          minimum: 0
+          description: Attempts ran out (spec §10).
+        last_delivery_at:
+          type: [string, 'null']
+          format: date-time
+        last_http_status:
+          type: [integer, 'null']
+          minimum: 100
+          maximum: 599
+
+    CreateWebhookRequest:
+      type: object
+      additionalProperties: false
+      required: [url, event_types]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: HTTPS only, no credentials in the authority (`user:pass@`).
+          pattern: '^https://[^/?#@]+([/?#].*)?$'
+          maxLength: 2048
+        event_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/EventType'
+
+    WebhookCreated:
+      type: object
+      additionalProperties: false
+      required: [webhook, secret]
+      properties:
+        webhook:
+          $ref: '#/components/schemas/Webhook'
+        secret:
+          type: string
+          description: HMAC signing secret. Shown only once; store it now.
+
+    # --- Errors -------------------------------------------------------------------------------
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error, request_id]
+      description: Unified error contract (spec 7.4).
+      properties:
+        error:
+          $ref: '#/components/schemas/Error'
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - unauthenticated
+            - session_expired
+            - forbidden
+            - csrf_failed
+            - origin_not_allowed
+            - not_found
+            - request_in_progress
+            - conflict
+            - file_too_large
+            - message_too_long
+            - validation_failed
+            - idempotency_key_reuse
+            - unsupported_file_type
+            - rate_limited
+            - budget_exceeded
+            - too_many_jobs
+            - internal_error
+            - provider_error
+            - provider_unavailable
+            - dependency_unavailable
+            - timeout
+        message:
+          type: string
+          description: Human-readable text. Never contains secrets or message content.
+        retryable:
+          type: boolean
+          description: Whether repeating the same request (with the same idempotency key) can succeed.
+        details:
+          type: object
+          description: Optional machine-readable context, for example invalid fields.
+          additionalProperties: true
+
+    TimeoutErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error, request_id]
+      description: |
+        `504` body of `sendMessage`: the unified error envelope narrowed to `timeout`.
+        `details.message_id` is required because the widget needs it for the recovery `GET`.
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, retryable, details]
+          properties:
+            code:
+              type: string
+              const: timeout
+            message:
+              type: string
+            retryable:
+              type: boolean
+              const: true
+            details:
+              type: object
+              additionalProperties: true
+              required: [message_id]
+              properties:
+                message_id:
+                  type: string
+                  format: uuid
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+
+    RateLimitedErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error, request_id]
+      description: The unified error envelope narrowed to `rate_limited`.
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, retryable]
+          properties:
+            code:
+              type: string
+              const: rate_limited
+            message:
+              type: string
+            retryable:
+              type: boolean
+            details:
+              type: object
+              additionalProperties: true
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+
+  responses:
+    BadRequest:
+      description: Body is not valid JSON, or a header or path ID is malformed or missing.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: invalid_request
+              message: Header Idempotency-Key is required
+              retryable: false
+              details:
+                header: Idempotency-Key
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    WidgetUnauthenticated:
+      description: Session token missing or invalid (`unauthenticated`) or expired (`session_expired`).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        # RFC 9110 15.5.2: a 401 must carry a challenge for the expected scheme.
+        WWW-Authenticate:
+          required: true
+          description: Authentication challenge for the session token.
+          schema:
+            type: string
+          example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unauthenticated:
+              summary: Token missing or invalid
+              value:
+                error:
+                  code: unauthenticated
+                  message: Session token is missing or invalid
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            sessionExpired:
+              summary: Session expired; create a new one
+              value:
+                error:
+                  code: session_expired
+                  message: The session has expired
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    AdminUnauthenticated:
+      # No WWW-Authenticate: cookie sessions have no registered HTTP auth scheme to challenge.
+      description: |
+        Cookie missing or invalid, or wrong login credentials (`unauthenticated`); admin
+        session expired (`session_expired`).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unauthenticated:
+              summary: Not logged in or wrong credentials
+              value:
+                error:
+                  code: unauthenticated
+                  message: Authentication required
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            sessionExpired:
+              summary: Admin session expired; log in again
+              value:
+                error:
+                  code: session_expired
+                  message: The session has expired
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    Forbidden:
+      description: |
+        Role too low (`forbidden`), CSRF token missing or wrong (`csrf_failed`), or
+        `Origin` not allowed (`origin_not_allowed`).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            forbidden:
+              summary: The role does not allow this operation
+              value:
+                error:
+                  code: forbidden
+                  message: This operation requires the owner role
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            csrfFailed:
+              summary: CSRF token missing or wrong
+              value:
+                error:
+                  code: csrf_failed
+                  message: CSRF token is missing or invalid
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            originNotAllowed:
+              summary: Request from a foreign origin
+              value:
+                error:
+                  code: origin_not_allowed
+                  message: Requests from this origin are not allowed
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    NotFound:
+      description: |
+        The resource does not exist or belongs to another workspace or session (its existence
+        is not revealed).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: not_found
+              message: Resource not found
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    RequestInProgress:
+      description: |
+        A request with this idempotency key is still being processed. Retry after
+        `Retry-After` seconds with the same key.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        # Required here (optional elsewhere): the widget needs the interval to retry.
+        Retry-After:
+          required: true
+          description: Seconds to wait before retrying with the same idempotency key.
+          schema:
+            type: integer
+            minimum: 0
+          example: 5
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: request_in_progress
+              message: A request with this idempotency key is still being processed
+              retryable: true
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    Conflict:
+      description: The resource state does not allow this operation.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: conflict
+              message: An embedding profile migration is already running
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    MessageTooLong:
+      description: '`message` is longer than the limit (spec 7.4, 9.2).'
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: message_too_long
+              message: The message exceeds the maximum length
+              retryable: false
+              details:
+                max_length: 2000
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    FileTooLarge:
+      description: The file is over the size limit, or the workspace storage limit would be exceeded.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: file_too_large
+              message: The file exceeds the maximum size
+              retryable: false
+              details:
+                limit: file
+                max_bytes: 10485760
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    UnprocessableEntity:
+      description: |
+        A field rule is broken (`validation_failed`), the idempotency key was reused with
+        another body (`idempotency_key_reuse`), or the file type is not supported
+        (`unsupported_file_type`).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            validationFailed:
+              summary: Field rule broken
+              value:
+                error:
+                  code: validation_failed
+                  message: Request body failed validation
+                  retryable: false
+                  details:
+                    fields:
+                      - path: email
+                        reason: must be an email address
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            idempotencyKeyReuse:
+              summary: Same key, different body
+              value:
+                error:
+                  code: idempotency_key_reuse
+                  message: This idempotency key was already used with a different request
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            unsupportedFileType:
+              summary: Not plain text, Markdown or PDF
+              value:
+                error:
+                  code: unsupported_file_type
+                  message: Only plain text, Markdown and PDF files are supported
+                  retryable: false
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    RateLimited:
+      description: Rate limit hit. Retry after `Retry-After` seconds.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        # Required here: spec §7.4 always pairs rate_limited with Retry-After.
+        Retry-After:
+          required: true
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+            minimum: 0
+          example: 30
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RateLimitedErrorResponse'
+          example:
+            error:
+              code: rate_limited
+              message: Too many requests, retry later
+              retryable: true
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    TooManyRequests:
+      description: |
+        Rate limit hit (`rate_limited`, with `Retry-After`), a budget or the session message
+        limit exhausted (`budget_exceeded`), or too many active indexing jobs in the
+        workspace (`too_many_jobs`). `Retry-After` is always sent with `rate_limited`.
+        A replay of a stored answer never gets `budget_exceeded`;
+        rate limits still apply to it.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            rateLimited:
+              summary: Rate limit hit
+              value:
+                error:
+                  code: rate_limited
+                  message: Too many requests, retry later
+                  retryable: true
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            budgetExceeded:
+              summary: Site budget exhausted
+              value:
+                error:
+                  code: budget_exceeded
+                  message: The budget for this site is exhausted
+                  retryable: false
+                  details:
+                    scope: site
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            tooManyJobs:
+              summary: Active job limit reached
+              value:
+                error:
+                  code: too_many_jobs
+                  message: Too many indexing jobs are running in this workspace
+                  retryable: true
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    InternalError:
+      description: |
+        Unexpected server error. The message is generic; details stay in the logs under
+        `request_id`. Not retryable: the failure may have happened after a paid call.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: internal_error
+              message: Internal server error
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    ProviderError:
+      description: The model provider returned an error the gateway could not recover from.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: provider_error
+              message: The model provider returned an error
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    ServiceUnavailable:
+      description: |
+        No model provider is available (`provider_unavailable`), or a dependency such as
+        PostgreSQL or the ai-service is down (`dependency_unavailable`).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            providerUnavailable:
+              summary: All allowed providers are unavailable
+              value:
+                error:
+                  code: provider_unavailable
+                  message: The answer service is temporarily unavailable
+                  retryable: true
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+            dependencyUnavailable:
+              summary: A dependency is unreachable
+              value:
+                error:
+                  code: dependency_unavailable
+                  message: A required dependency is unavailable
+                  retryable: true
+                request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    MessageTimeout:
+      description: |
+        The answer was not ready in time. The question is now `failed` with a retryable
+        `timeout`: retry with the same idempotency key and body to get the stored result or
+        a new attempt. `GET .../messages/{details.message_id}` shows the same state.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/TimeoutErrorResponse'
+          example:
+            error:
+              code: timeout
+              message: The answer was not ready in time
+              retryable: true
+              details:
+                message_id: 0193a1f0-9d20-7a01-8b02-1c2d3e4f5a6b
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
