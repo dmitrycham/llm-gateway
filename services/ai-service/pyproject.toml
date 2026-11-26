@@ -5,16 +5,22 @@ description = "RAG service and worker for llm-gateway"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.165.0",
     "pydantic>=2.14",
+    "pydantic-settings>=2.16.3",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "mypy>=1.18",
     "pytest>=8.4",
     "pytest-asyncio>=1.4",
     "pytest-cov>=7.1.0",
+    "pyyaml>=6.0.4",
     "ruff>=0.17",
+    "types-pyyaml>=6.0.12.20261122",
 ]
 
 [build-system]
