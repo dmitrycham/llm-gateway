@@ -83,8 +83,8 @@ paths:
         with `param` set to the field name.
 
         **Sampling parameters and providers.** Providers support different parameter sets
-        and ranges (for example, Anthropic accepts `temperature` only from 0 to 1 and has no
-        `seed` or penalties). Before routing, the gateway drops every candidate provider,
+        and ranges (for example, current Claude API versions accept no `temperature`,
+        `top_p`, `seed` or penalties). Before routing, the gateway drops every candidate provider,
         including fallbacks, that cannot honour the request's parameters as sent; it never
         changes a value silently. If no allowed provider can honour them, the request is
         `400 unsupported_parameter` before any provider call, and it is never stored as a
