@@ -8,3 +8,6 @@ api/openapi/gateway.yaml:
   operation-4xx-response:
     - '#/paths/~1internal~1health~1live/get/responses'
     - '#/paths/~1internal~1health~1ready/get/responses'
+api/openapi/public.yaml:
+  operation-4xx-response:
+    - '#/paths/~1health~1live/get/responses'

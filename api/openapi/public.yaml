@@ -1,0 +1,71 @@
+openapi: 3.1.0
+info:
+  title: Go API public and admin API
+  version: 0.1.0
+  summary: Public, widget and admin API of the Go API.
+  description: |
+    Public and admin API of the Go API (spec §7.1). This file is the source of truth
+    (ADR-005): every endpoint is defined here before it is implemented.
+
+    For now it holds only the liveness probe; the widget, session and admin endpoints come
+    with LGW-25.
+
+    **Request ID.** Every response carries `X-Request-ID`, a UUIDv7 the Go API creates for
+    each request. The Go API is the entry point, so it ignores any client value (spec §4.2,
+    ADR-001) and passes the ID through every hop and log line.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://go-api:8090
+    description: Docker Compose network
+
+tags:
+  - name: health
+    description: Liveness and readiness probes. No authentication.
+
+paths:
+  /health/live:
+    get:
+      tags: [health]
+      operationId: getLiveness
+      summary: Liveness probe
+      description: Returns 200 while the process can serve HTTP. Checks no dependencies.
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LivenessStatus'
+              example:
+                status: ok
+
+components:
+  headers:
+    XRequestId:
+      required: true
+      description: Request ID the Go API created for this request (UUIDv7).
+      schema:
+        $ref: '#/components/schemas/RequestId'
+      example: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+  schemas:
+    RequestId:
+      type: string
+      format: uuid
+      description: UUIDv7 created by the Go API (spec 4.2).
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+
+    LivenessStatus:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
