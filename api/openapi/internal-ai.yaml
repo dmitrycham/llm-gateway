@@ -34,6 +34,9 @@ info:
     maximum deadline) are not fixed in this schema; Python enforces the configured values at
     runtime and answers `422 validation_failed` when a request exceeds them.
 
+    **Unexpected errors.** Any error the service does not map to a code above is
+    `500 internal_error` in the same format, with a generic message and no internal details.
+
     **Tracing.** `traceparent` is optional and never causes a `400`. Tracing middleware
     parses it; an invalid value is ignored and a new trace is started (W3C Trace Context).
   license:
@@ -286,6 +289,8 @@ paths:
           $ref: '#/components/responses/UnprocessableEntity'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
         '502':
           $ref: '#/components/responses/ProviderError'
         '503':
@@ -651,6 +656,7 @@ components:
             - provider_unavailable
             - dependency_unavailable
             - timeout
+            - internal_error
         message:
           type: string
           description: Human-readable text. Never contains secrets or user message text.
@@ -796,6 +802,21 @@ components:
                   details:
                     scope: workspace
                 request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
+
+    InternalError:
+      description: |
+        Unexpected server error. The message is generic; details stay in the service logs
+        under `request_id`. Not retryable: the failure may have happened after a paid call.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: internal_error
+              message: Internal server error
+              retryable: false
+            request_id: 0193a1f0-9d12-7c33-a1b2-6f8e9d0c1b2a
 
     ProviderError:
       description: The provider returned an error the gateway could not recover from.
