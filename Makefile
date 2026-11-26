@@ -6,7 +6,7 @@ UV         := uv
 GOLANGCI_CONFIG := $(CURDIR)/.golangci.yml
 # Pinned so local runs and CI lint the contracts with the same rules.
 REDOCLY    := npx --yes @redocly/cli@2.83.0
-OPENAPI    := api/openapi/internal-ai.yaml api/openapi/gateway.yaml
+OPENAPI    := api/openapi/internal-ai.yaml api/openapi/gateway.yaml api/openapi/public.yaml
 
 .PHONY: help lint lint-go lint-py lint-api fmt fmt-go fmt-py test test-go test-py py-sync
 
