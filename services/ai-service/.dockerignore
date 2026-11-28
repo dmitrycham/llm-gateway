@@ -1,0 +1,12 @@
+# Keep the build context small; the image is built from the lock file and src/.
+**/.DS_Store
+**/__pycache__
+.venv
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.coverage
+htmlcov
+tests
+Dockerfile
+.dockerignore

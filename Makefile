@@ -8,7 +8,7 @@ GOLANGCI_CONFIG := $(CURDIR)/.golangci.yml
 REDOCLY    := npx --yes @redocly/cli@2.83.0
 OPENAPI    := api/openapi/internal-ai.yaml api/openapi/gateway.yaml api/openapi/public.yaml
 
-.PHONY: help lint lint-go lint-py lint-api fmt fmt-go fmt-py test test-go test-py py-sync
+.PHONY: help lint lint-go lint-py lint-api fmt fmt-go fmt-py test test-go test-py py-sync smoke
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-10s %s\n", $$1, $$2}'
@@ -54,3 +54,6 @@ test-py: py-sync ## Run Python tests
 
 py-sync:
 	@cd $(PY_SERVICE) && $(UV) sync --locked --quiet
+
+smoke: ## Smoke-test the running Compose stack
+	scripts/smoke-test.sh

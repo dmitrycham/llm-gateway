@@ -31,6 +31,35 @@ make test-go
 make test-py
 ```
 
+## Local stack
+
+Requirements: Docker with Compose v2 (OrbStack or Docker Desktop on macOS).
+
+```sh
+cp .env.example .env          # then change the passwords
+docker compose up --build -d
+make smoke                    # scripts/smoke-test.sh
+```
+
+| Service      | Host address                        | Notes                                    |
+|--------------|-------------------------------------|------------------------------------------|
+| `go-api`     | `http://127.0.0.1:8090/health/live` | Public API                               |
+| `postgres`   | `127.0.0.1:5432`                    | PostgreSQL 18 + pgvector                 |
+| `gateway`    | not published                       | Health probes only; `:8080` in Stage 2   |
+| `ai-service` | not published                       | Internal API (`internal-ai.yaml`)        |
+| `redis`      | not published                       | Rate limits and cache                    |
+
+- `migrate` runs once before the services start. It applies the `app`, `ai` and
+  `gateway` migrations in that order as the `migrator` role, the owner of every object.
+  Migrations live in `services/<service>/migrations` as
+  `NNNNNN_<name>.up.sql` / `.down.sql` (golang-migrate). Schema-qualify every name.
+- Ollama is optional and runs on the host (Docker on a Mac has no Metal GPU). Containers
+  reach it at `http://host.docker.internal:11434`.
+- `docker compose down` keeps the data. `docker compose down -v` is **destructive**: it
+  deletes the database volume. Roles and their passwords are created only on the first
+  start of an empty volume.
+- The `events` and `observability` profiles are reserved for later stages.
+
 ## License
 
 [MIT](LICENSE)
