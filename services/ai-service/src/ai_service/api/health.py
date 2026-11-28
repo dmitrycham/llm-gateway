@@ -137,7 +137,12 @@ async def _run(name: str, check: Check, timeout_s: float) -> CheckResult:
 def build_health_router(checks: ReadinessChecks, timeout_s: float) -> APIRouter:
     router = APIRouter(prefix="/internal/health", tags=["health"])
 
-    @router.get("/live", operation_id="getLiveness")
+    # AC1 demo (LGW-27), revert before merge: a response the contract does not have.
+    @router.get(
+        "/live",
+        operation_id="getLiveness",
+        responses={HTTPStatus.INTERNAL_SERVER_ERROR: {"description": "AC1 demo"}},
+    )
     async def live() -> LivenessStatus:
         return LivenessStatus(status="ok")
 

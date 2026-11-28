@@ -509,7 +509,7 @@ components:
         - answer
         - grounding
         - citations
-        - replayed
+        # AC1 demo (LGW-27), revert before merge: `replayed` no longer required, Go code not regenerated.
         - provider
         - model
         - usage
