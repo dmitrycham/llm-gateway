@@ -1,0 +1,6 @@
+ALTER DEFAULT PRIVILEGES IN SCHEMA app
+    REVOKE USAGE, SELECT ON SEQUENCES FROM app_service;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app
+    REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM app_service;
+-- No CASCADE: later down migrations must have removed every object first.
+DROP SCHEMA app;

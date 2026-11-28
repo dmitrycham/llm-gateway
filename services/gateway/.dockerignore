@@ -1,0 +1,6 @@
+# Keep the build context small; tests and docs are not part of the image.
+**/.DS_Store
+**/*_test.go
+*.md
+Dockerfile
+.dockerignore
