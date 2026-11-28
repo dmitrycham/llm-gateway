@@ -12,6 +12,9 @@ curl -i http://127.0.0.1:8090/health/live
 ```
 
 The HTTP API follows [`public.yaml`](../../api/openapi/public.yaml).
+`internal/aiclient` is the ai-service client, generated from
+[`internal-ai.yaml`](../../api/openapi/internal-ai.yaml) by oapi-codegen (`make generate`);
+do not edit `aiclient.gen.go` by hand.
 `GET /health/live` is the liveness probe (spec §7.1): `200 {"status":"ok"}` while the
 process serves HTTP. `/health/ready` comes with the first dependency (the database pool).
 

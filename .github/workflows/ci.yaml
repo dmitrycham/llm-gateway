@@ -1,0 +1,190 @@
+name: ci
+
+on:
+  pull_request:
+    # labeled/unlabeled re-run contract-compat when contract-breaking-ok changes.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOLANGCI_LINT_VERSION: v2.15.0
+  OASDIFF_VERSION: v1.41.0
+  UV_VERSION: 0.13.8
+  PYTHON_VERSION: '3.14'
+  NODE_VERSION: '26'
+
+# Every job's name equals its id: branch protection requires these names as status checks.
+jobs:
+  lint-go:
+    name: lint-go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # Pinned to a commit: a moved tag cannot change what runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.work
+          cache-dependency-path: services/*/go.sum
+      # Install only: the action's own run lints from the workspace root, which fails for a
+      # go.work tree; the Makefile lints each module.
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          install-only: true
+      - run: make lint-go
+
+  test-go:
+    name: test-go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.work
+          cache-dependency-path: services/*/go.sum
+      - run: make test-go
+
+  generated:
+    name: generated
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.work
+          cache-dependency-path: services/*/go.sum
+      - run: make check-generated
+
+  lint-py:
+    name: lint-py
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: services/ai-service/uv.lock
+      - run: make lint-py
+
+  test-py:
+    name: test-py
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: services/ai-service/uv.lock
+      # The drift-check tests call oasdiff; with CI set they fail instead of skipping without it.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.work
+          cache-dependency-path: services/*/go.sum
+      - name: Install oasdiff
+        run: go install "github.com/oasdiff/oasdiff@${OASDIFF_VERSION}"
+      - run: make test-py
+
+  lint-api:
+    name: lint-api
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: make lint-api
+
+  drift:
+    name: drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.work
+          cache-dependency-path: services/*/go.sum
+      - name: Install oasdiff
+        run: go install "github.com/oasdiff/oasdiff@${OASDIFF_VERSION}"
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: services/ai-service/uv.lock
+      - run: make check-drift
+
+  # No condition besides the event: a job skipped by `if` counts as passed for branch
+  # protection, so the pre-release bypass is decided inside the script, not here.
+  contract-compat:
+    name: contract-compat
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # Default merge-ref checkout: HEAD^1 is the exact base commit the merge was built on.
+      # fetch-depth 0 also fetches tags, which the bypass rule needs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.work
+          cache-dependency-path: services/*/go.sum
+      - name: Install oasdiff
+        run: go install "github.com/oasdiff/oasdiff@${OASDIFF_VERSION}"
+      - name: Test the check script
+        run: make check-compat-test
+      # contract-breaking-ok is honoured only before the first v* release tag (README, CI).
+      - name: Decide the pre-release bypass
+        id: bypass
+        env:
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'contract-breaking-ok') }}
+        run: |
+          release_tags="$(git tag --list 'v*')"
+          if [[ "$HAS_LABEL" == true && -z "$release_tags" ]]; then
+            echo "allow=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::contract-breaking-ok is set and no v* tag exists: breaking changes are allowed"
+          else
+            echo "allow=false" >> "$GITHUB_OUTPUT"
+            if [[ "$HAS_LABEL" == true ]]; then
+              echo "::warning::contract-breaking-ok is ignored: a v* release tag exists"
+            fi
+          fi
+      - name: Breaking-change check
+        env:
+          ALLOW_BREAKING: ${{ steps.bypass.outputs.allow }}
+        run: make check-compat BASE="$(git rev-parse HEAD^1)"

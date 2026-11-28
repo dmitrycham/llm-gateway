@@ -1,0 +1,5 @@
+# Operations in internal-ai.yaml that FastAPI does not implement yet, one `METHOD /path` per
+# line. The drift check (scripts/check-openapi-drift.sh) skips them. Delete a line in the pull
+# request that implements the operation; a line for an operation missing from the contract
+# fails the check.
+POST /internal/v1/chat/generate

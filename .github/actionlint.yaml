@@ -1,0 +1,8 @@
+# actionlint config.
+paths:
+  .github/workflows/release.yaml:
+    ignore:
+      # `concurrency.queue` is documented by GitHub ("Control the concurrency of workflows and
+      # jobs": single | max) but actionlint 1.7.12 does not know it yet. Remove this entry
+      # once actionlint supports the key.
+      - 'unexpected key "queue" for "concurrency" section'
