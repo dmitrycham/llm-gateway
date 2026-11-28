@@ -8,5 +8,6 @@
 .coverage
 htmlcov
 tests
+tools
 Dockerfile
 .dockerignore

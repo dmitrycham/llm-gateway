@@ -196,7 +196,7 @@ CONTRACT = Path(__file__).parents[4] / "api" / "openapi" / "internal-ai.yaml"
 
 def test_not_ready_schema_matches_contract_any_of() -> None:
     contract = yaml.safe_load(CONTRACT.read_text())
-    contract_rule = contract["components"]["schemas"]["NotReadyChecks"]["allOf"][1]["anyOf"]
+    contract_rule = contract["components"]["schemas"]["NotReadyChecks"]["anyOf"]
 
     exported = create_app(Settings()).openapi()["components"]["schemas"]["NotReadyChecks"]
 

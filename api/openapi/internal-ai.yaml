@@ -416,11 +416,29 @@ components:
         checks:
           $ref: '#/components/schemas/NotReadyChecks'
 
-    ReadinessChecks:
+    # ReadyChecks and NotReadyChecks are flat objects, not allOf over a shared base, so they
+    # match the FastAPI export field for field in the drift check (ADR-005).
+    ReadyChecks:
       type: object
       description: |
-        Result of each dependency check, keyed by dependency name. `postgres` and `gateway`
-        are required for readiness; others (such as `redis`) are optional.
+        Result of each dependency check, keyed by dependency name. Both required checks
+        (`postgres`, `gateway`) pass; optional checks such as `redis` may fail.
+      required: [postgres, gateway]
+      properties:
+        postgres:
+          type: string
+          const: ok
+        gateway:
+          type: string
+          const: ok
+      additionalProperties:
+        $ref: '#/components/schemas/CheckResult'
+
+    NotReadyChecks:
+      type: object
+      description: |
+        Result of each dependency check, keyed by dependency name. At least one required
+        check (`postgres`, `gateway`) fails.
       required: [postgres, gateway]
       properties:
         postgres:
@@ -429,28 +447,13 @@ components:
           $ref: '#/components/schemas/CheckResult'
       additionalProperties:
         $ref: '#/components/schemas/CheckResult'
-
-    ReadyChecks:
-      description: Both required checks pass. Optional checks may fail.
-      allOf:
-        - $ref: '#/components/schemas/ReadinessChecks'
+      anyOf:
         - properties:
             postgres:
-              const: ok
+              const: fail
+        - properties:
             gateway:
-              const: ok
-
-    NotReadyChecks:
-      description: At least one required check fails.
-      allOf:
-        - $ref: '#/components/schemas/ReadinessChecks'
-        - anyOf:
-            - properties:
-                postgres:
-                  const: fail
-            - properties:
-                gateway:
-                  const: fail
+              const: fail
 
     CheckResult:
       type: string

@@ -30,7 +30,7 @@ build-backend = "uv_build"
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-src = ["src", "tests"]
+src = ["src", "tests", "."]
 
 [tool.ruff.lint]
 select = [
@@ -52,8 +52,8 @@ select = [
 
 [tool.mypy]
 strict = true
-files = ["src", "tests"]
-mypy_path = "src"
+files = ["src", "tests", "tools"]
+mypy_path = "src:."
 plugins = ["pydantic.mypy"]
 
 [tool.pydantic-mypy]
@@ -63,6 +63,8 @@ warn_required_dynamic_aliases = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `tools` (dev scripts, not shipped) is imported by its tests from the project root.
+pythonpath = ["."]
 addopts = ["-ra", "--strict-markers", "--cov=ai_service", "--cov-report=term-missing"]
 asyncio_mode = "auto"
 # Explicit value silences the pytest-asyncio deprecation warning; each test gets a fresh loop.

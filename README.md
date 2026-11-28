@@ -21,7 +21,8 @@ and an LLM evaluation suite. The RAG widget is the gateway's first client.
 
 ## Development
 
-Requirements: Go, golangci-lint v2, Python 3.13+, uv, Node.js with npm (for `npx`).
+Requirements: Go, golangci-lint v2, Python 3.13+, uv, Node.js with npm (for `npx`),
+[oasdiff](https://github.com/oasdiff/oasdiff) 1.41+ (`brew install oasdiff`).
 
 ```sh
 make lint     # golangci-lint + ruff + mypy + Redocly (OpenAPI)
@@ -30,6 +31,39 @@ make fmt      # format Go and Python code
 make test-go
 make test-py
 ```
+
+### Contracts and generated code (ADR-005)
+
+The YAML files in `api/openapi` are the source of truth. Change the contract first.
+
+```sh
+make generate           # regenerate Go code (go-api internal/aiclient) from the contracts
+make check-generated    # fail if generated code is missing or stale (needs a clean tree)
+make check-drift        # FastAPI schema vs internal-ai.yaml
+make check-compat       # breaking changes vs BASE (default origin/main)
+make check-compat-test  # tests of the breaking-change script
+```
+
+- `api/openapi/internal-ai.pending.txt` lists operations FastAPI does not implement yet;
+  the drift check skips them. Delete a line in the PR that implements the operation.
+- A breaking change needs a new path version. Before the first `v*` release tag, a PR
+  labelled `contract-breaking-ok` may break a contract; CI ignores the label once a
+  release tag exists.
+
+## CI
+
+| Workflow       | When                       | What                                                    |
+|----------------|----------------------------|---------------------------------------------------------|
+| `ci.yaml`      | PR, push to `main`         | lint, tests, generated code, drift, contract-compat     |
+| `smoke.yml`    | PR, push to `main`         | Compose stack smoke test                                |
+| `release.yaml` | push to `main`, `v*` tags  | build images, Trivy, push to GHCR                       |
+
+- Required checks on `main` (strict, branch must be up to date): every `ci.yaml` job and
+  `Compose smoke test`.
+- Images: `ghcr.io/dmitrycham/llm-gateway-<service>`. `main` publishes `sha-<short>` and
+  `main`; a `v1.2.3` tag publishes `1.2.3`. Each image is built once, scanned by Trivy
+  (fails on fixable HIGH/CRITICAL), and only that scanned image is pushed. Reports go to
+  Security → Code scanning and to the run's artifacts.
 
 ## Local stack
 
