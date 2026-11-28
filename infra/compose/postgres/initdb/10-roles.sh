@@ -5,14 +5,15 @@
 # which run as migrator, the owner of every object.
 set -euo pipefail
 
-# Passwords go in as psql variables (:'name' quotes them), never spliced into the SQL.
+# Passwords come from the environment via \getenv, not -v: process arguments are
+# world-readable on the host, the environment is not. :'name' quotes them in SQL.
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
-  -v db="$POSTGRES_DB" \
-  -v migrator_password="$MIGRATOR_PASSWORD" \
-  -v app_service_password="$APP_SERVICE_PASSWORD" \
-  -v ai_service_password="$AI_SERVICE_PASSWORD" \
-  -v ai_worker_password="$AI_WORKER_PASSWORD" \
-  -v gateway_service_password="$GATEWAY_SERVICE_PASSWORD" <<'SQL'
+  -v db="$POSTGRES_DB" <<'SQL'
+\getenv migrator_password MIGRATOR_PASSWORD
+\getenv app_service_password APP_SERVICE_PASSWORD
+\getenv ai_service_password AI_SERVICE_PASSWORD
+\getenv ai_worker_password AI_WORKER_PASSWORD
+\getenv gateway_service_password GATEWAY_SERVICE_PASSWORD
 CREATE ROLE migrator LOGIN PASSWORD :'migrator_password';
 -- Service roles own nothing: they get row access through migration grants only.
 CREATE ROLE app_service LOGIN PASSWORD :'app_service_password';
